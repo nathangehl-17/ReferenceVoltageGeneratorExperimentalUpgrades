@@ -1,6 +1,7 @@
 /*
 To compile and run:
 gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm && ./main
+(Linux and macOS; Windows via mingw, see README)
 */
 
 #include <gtk/gtk.h>
@@ -15,12 +16,11 @@ gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm && 
    typedef DWORD speed_t;
 #  define SERIAL_INVALID INVALID_HANDLE_VALUE
 #else
+#  include <errno.h>
 #  include <fcntl.h>
+#  include <glob.h>
 #  include <termios.h>
 #  include <unistd.h>
-#  ifdef __APPLE__
-#    include <glob.h>
-#  endif
    typedef int serial_fd_t;
 #  define SERIAL_INVALID (-1)
 #endif
@@ -57,6 +57,27 @@ uint16_t voltageToCode(float v) {
 
 // Keep a global or static descriptor variable for the ongoing session
 static serial_fd_t active_serial_fd = SERIAL_INVALID;
+
+// Connection status line shown under the serial row (set in activate())
+static GtkLabel *status_label = NULL;
+
+#ifdef _WIN32
+static GThread *win_reader = NULL;       // background reader thread
+static gint     win_reader_stop = 0;     // set to ask the reader to exit
+static guint    conn_generation = 0;     // bumped on every disconnect (ignores stale events)
+#else
+static guint    serial_watch_id = 0;     // GLib source id of the POSIX read watch
+#endif
+
+static void set_status(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+static void set_status(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char *msg = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    if (status_label) gtk_label_set_text(status_label, msg);
+    g_free(msg);
+}
 
 // serial connection dropdowns (shared, heap-allocated in activate())
 typedef struct {
@@ -167,16 +188,18 @@ static serial_fd_t open_serial(const char *port, DWORD baud) {
     timeouts.ReadIntervalTimeout         = MAXDWORD; //50
     timeouts.ReadTotalTimeoutConstant    = 0; //500
     timeouts.ReadTotalTimeoutMultiplier  = 0; //10
-    timeouts.WriteTotalTimeoutConstant   = 500
+    timeouts.WriteTotalTimeoutConstant   = 500;
     timeouts.WriteTotalTimeoutMultiplier = 10;
     SetCommTimeouts(hPort, &timeouts);
 
     return hPort;
 }
 
-static void serial_write(serial_fd_t fd, const char *buf, size_t len) {
-    DWORD written;
-    WriteFile(fd, buf, (DWORD)len, &written, NULL);
+// Returns 0 on success, -1 on failure
+static int serial_write(serial_fd_t fd, const char *buf, size_t len) {
+    DWORD written = 0;
+    if (!WriteFile(fd, buf, (DWORD)len, &written, NULL) || written != (DWORD)len) return -1;
+    return 0;
 }
 
 static void serial_close(serial_fd_t fd) {
@@ -213,29 +236,46 @@ static speed_t baud_from_string(const char *s) {
 }
 
 static serial_fd_t open_serial(const char *port, speed_t baud) {
-    int fd = open(port, O_RDWR | O_NOCTTY | O_SYNC);
+    // Open non-blocking so a stuck modem line can't hang us; cleared again below
+    int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
 
     struct termios tty;
-    tcgetattr(fd, &tty);
-    cfsetospeed(&tty, baud);
-    cfsetispeed(&tty, baud);
-    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-    tty.c_iflag &= ~IGNBRK;
-    tty.c_lflag = 0;
-    tty.c_oflag = 0;
+    if (tcgetattr(fd, &tty) != 0) goto fail;
+
+    // Raw mode: the protocol is binary, so no CR/LF translation or XON/XOFF
+    // (otherwise bytes like 0x0D, 0x11, 0x13 would be altered or swallowed)
+    cfmakeraw(&tty);
+    tty.c_cflag &= ~(CSIZE | PARENB | PARODD | CSTOPB | CRTSCTS);
+    tty.c_cflag |= CS8 | CLOCAL | CREAD;
     tty.c_cc[VMIN]  = 0;
     tty.c_cc[VTIME] = 5;
-    tty.c_cflag |= (CLOCAL | CREAD);
-    tty.c_cflag &= ~(PARENB | PARODD);
-    tty.c_cflag &= ~CSTOPB;
-    tty.c_cflag &= ~CRTSCTS;
-    tcsetattr(fd, TCSANOW, &tty);
+    if (cfsetospeed(&tty, baud) != 0 || cfsetispeed(&tty, baud) != 0) goto fail;
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) goto fail;
+
+    tcflush(fd, TCIOFLUSH);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
     return fd;
+
+fail:;
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return -1;
 }
 
-static void serial_write(serial_fd_t fd, const char *buf, size_t len) {
-    write(fd, buf, len);
+// Returns 0 on success, -1 on failure
+static int serial_write(serial_fd_t fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t n = write(fd, buf, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
 }
 
 static void serial_close(serial_fd_t fd) {
@@ -247,6 +287,122 @@ static int serial_is_invalid(serial_fd_t fd) {
 }
 
 #endif /* _WIN32 */
+
+// Serial port discovery
+
+typedef struct {
+    char    *path;        // what open_serial() takes, e.g. "/dev/cu.usbmodem2101" or "COM7"
+    gboolean is_feather;  // looks like the USB CDC device the Feather presents
+} PortInfo;
+
+static void port_info_free(gpointer data) {
+    PortInfo *info = data;
+    g_free(info->path);
+    g_free(info);
+}
+
+static void add_port(GPtrArray *ports, const char *path, gboolean is_feather) {
+    PortInfo *info = g_new0(PortInfo, 1);
+    info->path = g_strdup(path);
+    info->is_feather = is_feather;
+    g_ptr_array_add(ports, info);
+}
+
+// Feather-looking ports first, then shorter names first so COM9 sorts before COM10
+static gint compare_ports(gconstpointer a, gconstpointer b) {
+    const PortInfo *pa = *(PortInfo * const *)a;
+    const PortInfo *pb = *(PortInfo * const *)b;
+    if (pa->is_feather != pb->is_feather) return pa->is_feather ? -1 : 1;
+    size_t la = strlen(pa->path), lb = strlen(pb->path);
+    if (la != lb) return la < lb ? -1 : 1;
+    return strcmp(pa->path, pb->path);
+}
+
+#ifdef _WIN32
+
+// Lists every COM port the driver stack has registered (no COM1-COM8 limit).
+// Native USB CDC devices like the Feather show up as \Device\USBSERnnn.
+static GPtrArray *enumerate_ports(void) {
+    GPtrArray *ports = g_ptr_array_new_with_free_func(port_info_free);
+    HKEY key;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DEVICEMAP\\SERIALCOMM",
+                      0, KEY_READ, &key) == ERROR_SUCCESS) {
+        for (DWORD i = 0; ; i++) {
+            char  name[256];
+            char  data[64] = { 0 };
+            DWORD name_len = sizeof(name);
+            DWORD data_len = sizeof(data) - 1;
+            DWORD type = 0;
+            LONG  r = RegEnumValueA(key, i, name, &name_len, NULL, &type,
+                                    (LPBYTE)data, &data_len);
+            if (r == ERROR_NO_MORE_ITEMS) break;
+            if (r != ERROR_SUCCESS || type != REG_SZ) continue;
+            add_port(ports, data, strstr(name, "USBSER") != NULL);
+        }
+        RegCloseKey(key);
+    }
+    g_ptr_array_sort(ports, compare_ports);
+    return ports;
+}
+
+#else /* POSIX */
+
+#ifdef __linux__
+// Reads the USB vendor id of a tty from sysfs; Adafruit (239a) and Espressif (303a)
+// are what a Feather ESP32-S3 enumerates as.
+static gboolean tty_is_feather(const char *path) {
+    char *name = g_path_get_basename(path);
+    static const char *const rel[] = { "device/../idVendor", "device/../../idVendor" };
+    gboolean found = FALSE;
+    for (size_t i = 0; i < G_N_ELEMENTS(rel) && !found; i++) {
+        char *file = g_strdup_printf("/sys/class/tty/%s/%s", name, rel[i]);
+        char *contents = NULL;
+        if (g_file_get_contents(file, &contents, NULL, NULL)) {
+            unsigned long vid = strtoul(contents, NULL, 16);
+            found = (vid == 0x239a || vid == 0x303a);
+            g_free(contents);
+        }
+        g_free(file);
+    }
+    g_free(name);
+    return found;
+}
+#elif defined(__APPLE__)
+// The Feather's native USB shows up as /dev/cu.usbmodem*
+static gboolean tty_is_feather(const char *path) {
+    return strstr(path, "usbmodem") != NULL;
+}
+#else
+static gboolean tty_is_feather(const char *path) {
+    (void)path;
+    return FALSE;
+}
+#endif
+
+static GPtrArray *enumerate_ports(void) {
+    GPtrArray *ports = g_ptr_array_new_with_free_func(port_info_free);
+#ifdef __APPLE__
+    // Only the callout (cu.*) nodes: tty.* blocks on open waiting for carrier
+    static const char *const patterns[] = {
+        "/dev/cu.usbmodem*", "/dev/cu.usbserial*",
+        "/dev/cu.SLAB_USBtoUART*", "/dev/cu.wchusbserial*", NULL
+    };
+#else
+    static const char *const patterns[] = { "/dev/ttyACM*", "/dev/ttyUSB*", NULL };
+#endif
+    for (int i = 0; patterns[i]; i++) {
+        glob_t gl = { 0 };
+        if (glob(patterns[i], 0, NULL, &gl) == 0) {
+            for (size_t j = 0; j < gl.gl_pathc; j++)
+                add_port(ports, gl.gl_pathv[j], tty_is_feather(gl.gl_pathv[j]));
+        }
+        globfree(&gl);
+    }
+    g_ptr_array_sort(ports, compare_ports);
+    return ports;
+}
+
+#endif /* port discovery */
 
 // Reads the selected COM port and baud rate strings from the shared dropdowns.
 // Returns FALSE (leaving *port_out/*baud_out untouched) if either dropdown has nothing selected.
@@ -263,23 +419,52 @@ static gboolean get_port_and_baud(ConnectData *conn, const char **port_out, cons
     return TRUE;
 }
 
-// Returns SERIAL_INVALID on any failure (no selection, or the port couldn't open).
-static serial_fd_t open_serial_from_conn(ConnectData *conn) {
-    const char *port, *baud_str;
-    if (!get_port_and_baud(conn, &port, &baud_str)) {
-        g_printerr("No COM port or baud rate selected.\n");
-        return SERIAL_INVALID;
+// Tears down the active connection (reader first, then the port). Safe to call when not connected.
+static void disconnect_serial(void) {
+    if (serial_is_invalid(active_serial_fd)) return;
+#ifdef _WIN32
+    if (win_reader) {
+        g_atomic_int_set(&win_reader_stop, 1);
+        g_thread_join(win_reader);
+        win_reader = NULL;
     }
-
-    serial_fd_t fd = open_serial(port, baud_from_string(baud_str));
-    /*if (serial_is_invalid(fd)) {
-        g_printerr("Failed to open serial port: %s\n", port);
-    }*/
-    return fd;
+    conn_generation++;
+#else
+    if (serial_watch_id) {
+        g_source_remove(serial_watch_id);
+        serial_watch_id = 0;
+    }
+#endif
+    serial_close(active_serial_fd);
+    active_serial_fd = SERIAL_INVALID;
 }
 
-// Sends 5 bytes: bank, chip, register, high half of value, low half of value.
-static void send_voltage_command(serial_fd_t fd, uint8_t reg, int channel, uint16_t value) {
+// The device went away (unplugged, port closed by the OS, write failed)
+static void connection_lost(const char *why) {
+    disconnect_serial();
+    set_status("Disconnected: %s", why);
+    g_printerr("Serial connection lost: %s\n", why);
+}
+
+static gboolean require_connection(void) {
+    if (!serial_is_invalid(active_serial_fd)) return TRUE;
+    set_status("Not connected. Choose a port and press Connect.");
+    g_printerr("Error: Cannot send. Port not connected!\n");
+    return FALSE;
+}
+
+// Writes to the persistent connection; the one place every command goes through.
+static gboolean send_bytes(const void *buf, size_t len) {
+    if (!require_connection()) return FALSE;
+    if (serial_write(active_serial_fd, (const char *)buf, len) != 0) {
+        connection_lost("write failed (was the board unplugged?)");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// Sends 6 bytes: start, bank, chip, register, high half of value, low half of value.
+static gboolean send_voltage_command(uint8_t reg, int channel, uint16_t value) {
     uint8_t bank = channel / DACS_PER_BANK;
     uint8_t chip = channel % DACS_PER_BANK;
     uint8_t high = (uint8_t)(value >> 8);
@@ -294,7 +479,7 @@ static void send_voltage_command(serial_fd_t fd, uint8_t reg, int channel, uint1
     msg[5] = low;
 
     g_print("Sending 0x: %02X %02X %02X %02X %02X\n", msg[1],msg[2],msg[3],msg[4],msg[5]);
-    serial_write(fd, (const char *)msg, sizeof(msg));
+    return send_bytes(msg, sizeof(msg));
 }
 
 // Updates an off/on toggle button's label and CSS name to match its state.
@@ -388,11 +573,7 @@ static void on_send_clicked(GtkButton *button, gpointer user_data) {
     }
     g_print("\n");
 
-    /*if (serial_is_invalid(active_serial_fd)) {
-        g_printerr("Error: Cannot send. Port not connected!\n");
-        return;
-    }*/
-    serial_write(active_serial_fd, msg, msg_len);
+    send_bytes(msg, msg_len);
 }
 
 // When 'update' clicked, send that voltage to the corresponding channel
@@ -404,11 +585,7 @@ static void on_update_clicked(GtkButton *button, gpointer user_data) {
     double value = atof(gtk_editable_get_text(GTK_EDITABLE(entry)));
     uint16_t v = voltageToCode(value);
 
-    /*if (serial_is_invalid(active_serial_fd)) {
-        g_printerr("Error: Cannot send. Port not connected!\n");
-        return;
-    }*/
-    send_voltage_command(active_serial_fd, REG_DAC, CH, v);
+    send_voltage_command(REG_DAC, CH, v);
 }
 
 // Power off the channel
@@ -428,19 +605,14 @@ static void on_off_clicked(GtkToggleButton *button, gpointer user_data) {
         v = 0x0001; // DAC power off
     }
 
-    /*if (serial_is_invalid(active_serial_fd)) {
-        g_printerr("Error: Cannot send. Port not connected!\n");
-        return;
-    }*/
-
-    send_voltage_command(active_serial_fd, REG_CONFIG, CH, v);
+    send_voltage_command(REG_CONFIG, CH, v);
 }
 
 // Assuming microcontroller RST pin is active LOW, pull it down.
 static void on_reset_clicked(GtkButton *button) {
     uint8_t msg[2] = {RST_CMD_START, 0x00};
     g_print("Pulling down RST pin.\n"); // "%02X %02X\n", msg[0], msg[1]
-    serial_write(active_serial_fd, (const char *)msg, sizeof(msg));
+    send_bytes(msg, sizeof(msg));
 }
 
 static void on_entry_activate(GtkEntry *entry, gpointer user_data) {
@@ -455,20 +627,26 @@ static void on_entry_focus_leave(GtkEventController *controller, gpointer user_d
 }
 
 #ifndef _WIN32
-// Callback triggered when the serial port has data to read (Linux)
+// Callback triggered when the serial port has data to read (Linux/macOS)
 static gboolean on_serial_data_available(GIOChannel *source, GIOCondition condition, gpointer user_data) {
     if (condition & (G_IO_IN | G_IO_PRI)) {
         int fd = g_io_channel_unix_get_fd(source);
         char buf[256];
         ssize_t bytes_read = read(fd, buf, sizeof(buf) - 1);
-        
+
+        if (bytes_read < 0 && errno != EAGAIN && errno != EINTR) {
+            serial_watch_id = 0; // returning FALSE below removes the source
+            connection_lost("device removed");
+            return FALSE;
+        }
+
         if (bytes_read > 0) {
             buf[bytes_read] = '\0';
-            
+
             // Tokenize by newline to catch "RX: <byte>" lines
             char *line = strtok(buf, "\n");
             static int byte_index = 0; // Tracks which label to update (0, 1, or 2)
-            
+
             while (line != NULL) {
                 unsigned int hex_val;
                 // Parse the expected format: "RX: <byte>" (e.g., "RX: 0xAA" or "RX: AA")
@@ -477,7 +655,7 @@ static gboolean on_serial_data_available(GIOChannel *source, GIOCondition condit
                         char markup[64];
                         snprintf(markup, sizeof(markup), "<b>0x%02X</b>", hex_val);
                         gtk_label_set_markup(GTK_LABEL(global_rx_widgets->received_labels[byte_index]), markup);
-                        
+
                         byte_index++;
                         if (byte_index >= 3) {
                             byte_index = 0; // Reset after filling all 3 bytes
@@ -488,12 +666,13 @@ static gboolean on_serial_data_available(GIOChannel *source, GIOCondition condit
             }
         }
     }
-    
+
     if (condition & (G_IO_ERR | G_IO_HUP | G_IO_NVAL)) {
-        g_printerr("Serial connection closed or lost.\n");
-        return FALSE; // Removes the watch hook
+        serial_watch_id = 0; // returning FALSE below removes the source
+        connection_lost("device removed");
+        return FALSE;
     }
-    
+
     return TRUE; // Continue monitoring
 }
 #endif
@@ -521,20 +700,33 @@ static gboolean update_rx_label_cb(gpointer data) {
 // Structure to pass connection info to the thread
 typedef struct {
     HANDLE hPort;
+    guint  generation;
 } WinThreadData;
+
+// Runs on the main loop when the reader notices the port died
+static gboolean win_connection_lost_idle(gpointer data) {
+    if (GPOINTER_TO_UINT(data) == conn_generation && !serial_is_invalid(active_serial_fd))
+        connection_lost("device removed");
+    return FALSE;
+}
 
 // Background thread function for Windows serial parsing
 static gpointer windows_serial_thread_func(gpointer user_data) {
     WinThreadData *tdata = (WinThreadData *)user_data;
     HANDLE hPort = tdata->hPort;
+    guint generation = tdata->generation;
     g_free(tdata);
 
     char rx_buf[512];
     DWORD bytes_read;
     int byte_index = 0;
 
-    while (TRUE) {
-        if (ReadFile(hPort, rx_buf, sizeof(rx_buf) - 1, &bytes_read, NULL) && bytes_read > 0) {
+    while (!g_atomic_int_get(&win_reader_stop)) {
+        if (!ReadFile(hPort, rx_buf, sizeof(rx_buf) - 1, &bytes_read, NULL)) {
+            g_idle_add(win_connection_lost_idle, GUINT_TO_POINTER(generation));
+            break;
+        }
+        if (bytes_read > 0) {
             rx_buf[bytes_read] = '\0';
 
             char *line = strtok(rx_buf, "\n");
@@ -561,52 +753,134 @@ static gpointer windows_serial_thread_func(gpointer user_data) {
 }
 #endif
 
+// Human-readable reason the last open_serial() failed, with a fix where we know one
+static const char *serial_open_error(char *buf, size_t n) {
+#ifdef _WIN32
+    DWORD err = GetLastError();
+    if (err == ERROR_ACCESS_DENIED)
+        snprintf(buf, n, "port is busy (is another program using it?)");
+    else if (err == ERROR_FILE_NOT_FOUND)
+        snprintf(buf, n, "port not found (was the board unplugged?)");
+    else
+        snprintf(buf, n, "Windows error %lu", (unsigned long)err);
+#else
+    if (errno == EACCES)
+        snprintf(buf, n, "permission denied (on Linux add yourself to the 'dialout' group)");
+    else if (errno == EBUSY)
+        snprintf(buf, n, "port is busy (is another program using it?)");
+    else
+        snprintf(buf, n, "%s", strerror(errno));
+#endif
+    return buf;
+}
 
-static void on_connect_clicked(GtkButton *button, gpointer user_data) {
-    ConnectData *data = (ConnectData *)user_data;
-
-    const char *port = "None";
-    const char *baud = "None";
-    get_port_and_baud(data, &port, &baud);
-
-    // If an older connection is active, clean it up first
-    if (!serial_is_invalid(active_serial_fd)) {
-        g_print("Closing existing connection...\n");
-        serial_close(active_serial_fd);
-        active_serial_fd = SERIAL_INVALID;
+// Opens the selected port and starts the reader. Replaces any existing connection.
+static gboolean connect_serial(ConnectData *data) {
+    const char *port_sel, *baud;
+    if (!get_port_and_baud(data, &port_sel, &baud)) {
+        set_status("No serial port selected. Plug in the board and press Refresh.");
+        return FALSE;
     }
+    char *port = g_strdup(port_sel); // the dropdown's string can change under us
 
+    disconnect_serial();
     g_print("Connecting on %s at %s baud...\n", port, baud);
 
-    active_serial_fd = open_serial(port, baud_from_string(baud));
-    if (serial_is_invalid(active_serial_fd)) {
-        g_printerr("Warning: could not open %s — check the port.\n", port);
-        return;
+    serial_fd_t fd = open_serial(port, baud_from_string(baud));
+    if (serial_is_invalid(fd)) {
+        char why[160];
+        set_status("Could not open %s: %s", port, serial_open_error(why, sizeof(why)));
+        g_printerr("Could not open %s: %s\n", port, why);
+        g_free(port);
+        return FALSE;
     }
-    g_print("Port %s opened successfully and listening.\n", port);
+    active_serial_fd = fd;
 
     // Hook up asynchronous reading based on OS
 #ifdef _WIN32
     WinThreadData *tdata = g_new(WinThreadData, 1);
-    tdata->hPort = active_serial_fd;
-    g_thread_new("windows_serial_reader", windows_serial_thread_func, tdata);
+    tdata->hPort = fd;
+    tdata->generation = conn_generation;
+    g_atomic_int_set(&win_reader_stop, 0);
+    win_reader = g_thread_new("windows_serial_reader", windows_serial_thread_func, tdata);
 #else
-    GIOChannel *channel = g_io_channel_unix_new(active_serial_fd);
-    g_io_add_watch(channel, G_IO_IN | G_IO_PRI | G_IO_ERR | G_IO_HUP, on_serial_data_available, NULL);
-    g_io_channel_unref(channel); // The main loop keeps its own reference now
+    GIOChannel *channel = g_io_channel_unix_new(fd);
+    serial_watch_id = g_io_add_watch(channel, G_IO_IN | G_IO_PRI | G_IO_ERR | G_IO_HUP,
+                                     on_serial_data_available, NULL);
+    g_io_channel_unref(channel); // The watch keeps its own reference now
 #endif
+
+    set_status("Connected: %s @ %s baud", port, baud);
+    g_print("Port %s opened successfully and listening.\n", port);
+    g_free(port);
+    return TRUE;
+}
+
+// Rebuilds the port dropdown from what is plugged in right now. If exactly one
+// Feather-looking port is present and we aren't connected, connects to it.
+static void refresh_ports(ConnectData *data) {
+    GPtrArray *ports = enumerate_ports();
+    GtkStringList *list = GTK_STRING_LIST(gtk_drop_down_get_model(data->com_dropdown));
+    gboolean connected = !serial_is_invalid(active_serial_fd);
+
+    char *prev = NULL;
+    GtkStringObject *sel = GTK_STRING_OBJECT(gtk_drop_down_get_selected_item(data->com_dropdown));
+    if (sel) prev = g_strdup(gtk_string_object_get_string(sel));
+
+    const char **names = g_new0(const char *, ports->len + 1);
+    guint feathers = 0, feather_idx = 0, prev_idx = GTK_INVALID_LIST_POSITION;
+    for (guint i = 0; i < ports->len; i++) {
+        PortInfo *info = g_ptr_array_index(ports, i);
+        names[i] = info->path;
+        if (info->is_feather && feathers++ == 0) feather_idx = i;
+        if (prev && strcmp(prev, info->path) == 0) prev_idx = i;
+    }
+
+    gtk_string_list_splice(list, 0, g_list_model_get_n_items(G_LIST_MODEL(list)), names);
+
+    if (ports->len > 0) {
+        guint pick = 0;
+        if (connected && prev_idx != GTK_INVALID_LIST_POSITION) pick = prev_idx;
+        else if (feathers > 0) pick = feather_idx;
+        else if (prev_idx != GTK_INVALID_LIST_POSITION) pick = prev_idx;
+        gtk_drop_down_set_selected(data->com_dropdown, pick);
+    }
+
+    if (!connected) {
+        if (ports->len == 0)
+            set_status("No serial ports found. Plug in the board and press Refresh.");
+        else if (feathers == 1)
+            connect_serial(data);
+        else
+            set_status("Select a port and press Connect.");
+    }
+
+    g_free(names);
+    g_free(prev);
+    g_ptr_array_free(ports, TRUE);
+}
+
+static void on_refresh_clicked(GtkButton *button, gpointer user_data) {
+    refresh_ports((ConnectData *)user_data);
+}
+
+static void on_connect_clicked(GtkButton *button, gpointer user_data) {
+    connect_serial((ConnectData *)user_data);
 }
 
 // Close connection
 static void on_disconnect_clicked(GtkButton *button, gpointer user_data) {
-    g_print("Checking for existing connection to close ...\n");
-    if (!serial_is_invalid(active_serial_fd)) {
-        g_print("Existing connection found. Closing...\n");
-        serial_close(active_serial_fd);
-        active_serial_fd = SERIAL_INVALID;
-        g_print("Closed.\n");
+    if (serial_is_invalid(active_serial_fd)) {
+        set_status("Not connected.");
+        return;
     }
-    g_print("No connection to close.\n");
+    disconnect_serial();
+    set_status("Disconnected.");
+    g_print("Serial connection closed.\n");
+}
+
+static void on_window_destroy(GtkWidget *window, gpointer user_data) {
+    disconnect_serial();
 }
 
 // Change toggle 'on/off' state without running callback
@@ -640,8 +914,7 @@ static void on_allon_clicked(GtkButton *button, gpointer user_data) {
 static void on_updateall_clicked(GtkButton *button, gpointer user_data) {
     AllBtnData *data = (AllBtnData *)user_data;
 
-    serial_fd_t fd = open_serial_from_conn(data->conn);
-    if (serial_is_invalid(fd)) return;
+    if (!require_connection()) return;
 
     // Send one command per channel over the single open connection
     for (int i = 0; i < 12; i++) {
@@ -649,10 +922,8 @@ static void on_updateall_clicked(GtkButton *button, gpointer user_data) {
         double value    = atof(gtk_editable_get_text(GTK_EDITABLE(entry)));
         uint16_t v = voltageToCode(value);
 
-        send_voltage_command(fd, REG_DAC, i, v); //data->channel_values[i]
+        if (!send_voltage_command(REG_DAC, i, v)) return; //data->channel_values[i]
     }
-
-    serial_close(fd);
 }
 
 // When the byte entry value is changed, check if it's a valid hex value
@@ -692,6 +963,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     
     window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Reference Voltage Generator");
+    g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), NULL);
     gtk_window_set_resizable(GTK_WINDOW(window), TRUE);
 
     GtkWidget *scroll = gtk_scrolled_window_new();
@@ -715,35 +987,12 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_set_halign(com_label, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(conn_box), com_label);
 
-#ifdef __APPLE__
-    // macOS names USB serial devices /dev/cu.usbmodem*, /dev/cu.usbserial*, etc.
-    // Scan for the ones currently attached, then fall back to a placeholder.
-    glob_t gl = {0};
-    glob("/dev/cu.usbmodem*", 0, NULL, &gl);
-    glob("/dev/cu.usbserial*", GLOB_APPEND, NULL, &gl);
-    glob("/dev/cu.SLAB_USBtoUART*", GLOB_APPEND, NULL, &gl);
-    const char *com_ports[gl.gl_pathc + 2];
-    for (size_t i = 0; i < gl.gl_pathc; i++) com_ports[i] = gl.gl_pathv[i];
-    if (gl.gl_pathc == 0) com_ports[0] = "/dev/cu.usbmodem1101";
-    com_ports[gl.gl_pathc ? gl.gl_pathc : 1] = NULL;
-    const guint default_port = 0;
-#else
-    const char *com_ports[] = {
-        "COM1", "COM2", "COM3", "COM4",
-        "COM5", "COM6", "COM7", "COM8",
-        "/dev/ttyUSB0", "/dev/ttyUSB1",
-        "/dev/ttyACM0", "/dev/ttyACM1",
-        NULL
-    };
-    const guint default_port = 10; // /dev/ttyACM0
-#endif
-    GtkStringList *com_list = gtk_string_list_new(com_ports);
-#ifdef __APPLE__
-    globfree(&gl);
-#endif
-    GtkWidget *com_dropdown = gtk_drop_down_new(G_LIST_MODEL(com_list), NULL);
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(com_dropdown), default_port);
+    // Filled in by refresh_ports() once the rest of the UI exists
+    GtkWidget *com_dropdown = gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(NULL)), NULL);
     gtk_box_append(GTK_BOX(conn_box), com_dropdown);
+
+    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
+    gtk_box_append(GTK_BOX(conn_box), refresh_btn);
 
     GtkWidget *baud_label = gtk_label_new("Baud Rate:");
     gtk_widget_set_halign(baud_label, GTK_ALIGN_CENTER);
@@ -771,8 +1020,15 @@ static void activate(GtkApplication *app, gpointer user_data) {
     conn_data->baud_dropdown = GTK_DROP_DOWN(baud_dropdown);
     g_signal_connect(connect_btn, "clicked", G_CALLBACK(on_connect_clicked), conn_data);
     g_signal_connect(disconnect_btn, "clicked", G_CALLBACK(on_disconnect_clicked), NULL);
+    g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_clicked), conn_data);
     gtk_box_append(GTK_BOX(conn_box), connect_btn);
     gtk_box_append(GTK_BOX(conn_box), disconnect_btn);
+
+    // Connection status line, then populate the port list (auto-connects to a lone Feather)
+    status_label = GTK_LABEL(gtk_label_new("Disconnected"));
+    gtk_widget_set_halign(GTK_WIDGET(status_label), GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(vbox), GTK_WIDGET(status_label));
+    refresh_ports(conn_data);
 
     // Channel grid with channel number, voltage entry, increase/decrease, etc
     GtkWidget *grid = gtk_grid_new();
