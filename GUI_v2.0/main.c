@@ -105,6 +105,7 @@ typedef struct {
     BtnCallbackData *off_data[12];       // the 12 BtnCallbackData pointers for the off buttons
                                          // (needed to match the handler when blocking/unblocking signals)
     GtkWidget       *entry_boxes[12];    // the 12 per-channel voltage entries
+    GtkWidget       *channel_labels[12]; // the "Channel N:" labels (presets add a name in parentheses)
     ConnectData     *conn;               // shared serial dropdowns
 } AllBtnData;
 
@@ -928,9 +929,10 @@ static void on_updateall_clicked(GtkButton *button, gpointer user_data) {
 
 // Presets: named sets of channel voltages kept in PRESET_FILE (GKeyFile format), e.g.
 //   [Smoke Test]
-//   ch0=1.2
+//   ch0 (DISCBIAS)=1.2
 //   ch5=2.5
-// Channels a preset doesn't list are left alone. Edit the file by hand or use "Save current".
+// A key is "ch<N>" optionally followed by a label such as " (DISCBIAS)", which the GUI ignores
+// when reading. Channels a preset doesn't list are left alone. Edit the file by hand or use "Save current".
 #define PRESET_FILE "presets.ini"
 
 typedef struct {
@@ -944,6 +946,33 @@ static GKeyFile *presets_open(void) {
     // A missing file just means no presets yet
     g_key_file_load_from_file(kf, PRESET_FILE, G_KEY_FILE_KEEP_COMMENTS, NULL);
     return kf;
+}
+
+// Returns the key in `group` that refers to channel `ch` ("ch3" or "ch3 (READBIAS1)"), or NULL
+static char *preset_key_for_channel(GKeyFile *kf, const char *group, int ch) {
+    gchar **keys = g_key_file_get_keys(kf, group, NULL, NULL);
+    char *found = NULL;
+    for (int i = 0; keys && keys[i] && !found; i++) {
+        int num, n = 0;
+        if (sscanf(keys[i], "ch%d%n", &num, &n) < 1) continue;
+        if (num == ch && (keys[i][n] == '\0' || keys[i][n] == ' ' || keys[i][n] == '('))
+            found = g_strdup(keys[i]);
+    }
+    g_strfreev(keys);
+    return found;
+}
+
+// Shows "Channel N (NAME):" when the preset key carries a label like "ch3 (READBIAS1)"
+static void set_channel_label(GtkWidget *label, int ch, const char *key) {
+    const char *open = strchr(key, '(');
+    const char *close = open ? strrchr(open, ')') : NULL;
+    char *text;
+    if (open && close && close > open + 1)
+        text = g_strdup_printf("Channel %d (%.*s):", ch, (int)(close - open - 1), open + 1);
+    else
+        text = g_strdup_printf("Channel %d:", ch);
+    gtk_label_set_text(GTK_LABEL(label), text);
+    g_free(text);
 }
 
 // Rebuilds the preset dropdown from the file, selecting `select_name` if it exists
@@ -980,16 +1009,18 @@ static void preset_apply(PresetData *pd, gboolean send) {
     int loaded = 0;
 
     for (int i = 0; i < 12; i++) {
-        char key[16];
-        snprintf(key, sizeof(key), "ch%d", i);
-        if (!g_key_file_has_key(kf, name, key, NULL)) continue;
+        char *key = preset_key_for_channel(kf, name, i);
+        if (!key) continue;
         GError *err = NULL;
         double v = g_key_file_get_double(kf, name, key, &err);
         if (err) {
             set_status("Preset \"%s\": bad value for %s", name, key);
             g_error_free(err);
+            g_free(key);
             goto done; // don't send a half-read preset
         }
+        set_channel_label(pd->all->channel_labels[i], i, key);
+        g_free(key);
         apply_value(GTK_ENTRY(pd->all->entry_boxes[i]), v);
         present[i] = TRUE;
         loaded++;
@@ -1031,13 +1062,20 @@ static void on_preset_save_clicked(GtkButton *button, gpointer user_data) {
     }
 
     GKeyFile *kf = presets_open();
+    // Reuse the key (with its label) already in this preset, else the first preset's labels
+    gchar **groups = g_key_file_get_groups(kf, NULL);
+    const char *label_group = groups && groups[0] ? groups[0] : NULL;
     for (int i = 0; i < 12; i++) {
-        char key[16], val[32];
-        snprintf(key, sizeof(key), "ch%d", i);
+        char val[32];
+        char *key = preset_key_for_channel(kf, name, i);
+        if (!key && label_group) key = preset_key_for_channel(kf, label_group, i);
+        if (!key) key = g_strdup_printf("ch%d", i);
         double v = snap_and_clamp(atof(gtk_editable_get_text(GTK_EDITABLE(pd->all->entry_boxes[i]))));
         snprintf(val, sizeof(val), "%.4f", v);
         g_key_file_set_value(kf, name, key, val);
+        g_free(key);
     }
+    g_strfreev(groups);
 
     GError *err = NULL;
     if (g_key_file_save_to_file(kf, PRESET_FILE, &err)) {
@@ -1111,7 +1149,13 @@ static const char *const THEME_CSS =
 
 static void apply_theme(void) {
     GtkSettings *settings = gtk_settings_get_default();
-    if (settings) g_object_set(settings, "gtk-application-prefer-dark-theme", TRUE, NULL);
+    if (settings) {
+#if GTK_CHECK_VERSION(4, 20, 0)
+        g_object_set(settings, "gtk-interface-color-scheme", GTK_INTERFACE_COLOR_SCHEME_DARK, NULL);
+#else
+        g_object_set(settings, "gtk-application-prefer-dark-theme", TRUE, NULL);
+#endif
+    }
 
     GtkCssProvider *provider = gtk_css_provider_new();
 #if GTK_CHECK_VERSION(4, 12, 0)
@@ -1207,6 +1251,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(vbox), grid);
  
     GtkWidget       *entry_boxes[12];
+    GtkWidget       *channel_labels[12];
     GtkToggleButton *off_buttons[12];
     BtnCallbackData *off_cb_data_arr[12]; // one BtnCallbackData* per off button
     GtkWidget       *update_buttons[12];
@@ -1217,6 +1262,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
         GtkWidget *label = gtk_label_new(label_text);
         gtk_widget_set_halign(label, GTK_ALIGN_END);
         gtk_grid_attach(GTK_GRID(grid), label, 0, i, 1, 1);
+        channel_labels[i] = label;
 
         GtkWidget *entry = gtk_entry_new();
         apply_value(GTK_ENTRY(entry), 0.0);
@@ -1279,6 +1325,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
         all_data->off_buttons[i]    = off_buttons[i];
         all_data->off_data[i]       = off_cb_data_arr[i];
         all_data->entry_boxes[i]    = entry_boxes[i];
+        all_data->channel_labels[i] = channel_labels[i];
     }
 
     g_signal_connect(all_off_btn,    "clicked", G_CALLBACK(on_alloff_clicked),    all_data);
