@@ -198,8 +198,13 @@ static speed_t baud_from_string(const char *s) {
         case 57600:  return B57600;
         case 115200: return B115200;
         case 230400: return B230400;
-        case 460800: return B460800;
-        case 921600: return B921600;
+        #ifdef __APPLE__
+		    case 460800: return 460800;
+		    case 921600: return 921600;
+		#else
+		    case 460800: return B460800;
+		    case 921600: return B921600;
+		#endif
         default:     return B115200;
     }
 }
