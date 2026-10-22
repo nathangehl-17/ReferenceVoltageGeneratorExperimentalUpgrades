@@ -4,3 +4,6 @@ VHDL/work/
 VHDL/i2c.cr.mti
 VHDL/i2c.mpf
 *.bak
+
+# Local reference documents
+docs/
