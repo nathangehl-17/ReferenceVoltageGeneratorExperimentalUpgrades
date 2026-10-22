@@ -105,7 +105,7 @@ typedef struct {
     BtnCallbackData *off_data[12];       // the 12 BtnCallbackData pointers for the off buttons
                                          // (needed to match the handler when blocking/unblocking signals)
     GtkWidget       *entry_boxes[12];    // the 12 per-channel voltage entries
-    GtkWidget       *channel_labels[12]; // the "Channel N:" labels (presets add a name in parentheses)
+    GtkWidget       *channel_names[12];  // the 12 per-channel name entries (saved with presets)
     ConnectData     *conn;               // shared serial dropdowns
 } AllBtnData;
 
@@ -927,13 +927,32 @@ static void on_updateall_clicked(GtkButton *button, gpointer user_data) {
     }
 }
 
-// Presets: named sets of channel voltages kept in PRESET_FILE (GKeyFile format), e.g.
+// Presets: named sets of channel voltages kept in the preset file (GKeyFile format), e.g.
 //   [Smoke Test]
 //   ch0 (DISCBIAS)=1.2
 //   ch5=2.5
 // A key is "ch<N>" optionally followed by a label such as " (DISCBIAS)", which the GUI ignores
 // when reading. Channels a preset doesn't list are left alone. Edit the file by hand or use "Save current".
-#define PRESET_FILE "presets.ini"
+#define PRESET_FILE preset_file()
+
+// Where presets live: $RVG_PRESETS if set, else ./presets.ini if it exists, else
+// <user config dir>/rvg/presets.ini. (So launching from any directory finds the same file.)
+static const char *preset_file(void) {
+    static char *path = NULL;
+    if (path) return path;
+    const char *env = g_getenv("RVG_PRESETS");
+    if (env && *env) {
+        path = g_strdup(env);
+    } else if (g_file_test("presets.ini", G_FILE_TEST_EXISTS)) {
+        path = g_strdup("presets.ini");
+    } else {
+        char *dir = g_build_filename(g_get_user_config_dir(), "rvg", NULL);
+        g_mkdir_with_parents(dir, 0755);
+        path = g_build_filename(dir, "presets.ini", NULL);
+        g_free(dir);
+    }
+    return path;
+}
 
 typedef struct {
     AllBtnData  *all;
@@ -962,17 +981,24 @@ static char *preset_key_for_channel(GKeyFile *kf, const char *group, int ch) {
     return found;
 }
 
-// Shows "Channel N (NAME):" when the preset key carries a label like "ch3 (READBIAS1)"
-static void set_channel_label(GtkWidget *label, int ch, const char *key) {
+// Pulls NAME out of a preset key like "ch3 (READBIAS1)"; empty string when there is no label
+static char *name_from_key(const char *key) {
     const char *open = strchr(key, '(');
     const char *close = open ? strrchr(open, ')') : NULL;
-    char *text;
     if (open && close && close > open + 1)
-        text = g_strdup_printf("Channel %d (%.*s):", ch, (int)(close - open - 1), open + 1);
-    else
-        text = g_strdup_printf("Channel %d:", ch);
-    gtk_label_set_text(GTK_LABEL(label), text);
-    g_free(text);
+        return g_strndup(open + 1, (gsize)(close - open - 1));
+    return g_strdup("");
+}
+
+// Builds the preset key for a channel: "ch3 (NAME)", or plain "ch3" when it has no name.
+// Characters that can't appear in a key are replaced.
+static char *key_for_channel(int ch, const char *name) {
+    char *clean = g_strstrip(g_strdup(name));
+    for (char *p = clean; *p; p++)
+        if (*p == '=' || *p == '[' || *p == ']' || g_ascii_iscntrl(*p)) *p = '-';
+    char *key = clean[0] ? g_strdup_printf("ch%d (%s)", ch, clean) : g_strdup_printf("ch%d", ch);
+    g_free(clean);
+    return key;
 }
 
 // Rebuilds the preset dropdown from the file, selecting `select_name` if it exists
@@ -1019,7 +1045,9 @@ static void preset_apply(PresetData *pd, gboolean send) {
             g_free(key);
             goto done; // don't send a half-read preset
         }
-        set_channel_label(pd->all->channel_labels[i], i, key);
+        char *chname = name_from_key(key);
+        gtk_editable_set_text(GTK_EDITABLE(pd->all->channel_names[i]), chname);
+        g_free(chname);
         g_free(key);
         apply_value(GTK_ENTRY(pd->all->entry_boxes[i]), v);
         present[i] = TRUE;
@@ -1062,20 +1090,20 @@ static void on_preset_save_clicked(GtkButton *button, gpointer user_data) {
     }
 
     GKeyFile *kf = presets_open();
-    // Reuse the key (with its label) already in this preset, else the first preset's labels
-    gchar **groups = g_key_file_get_groups(kf, NULL);
-    const char *label_group = groups && groups[0] ? groups[0] : NULL;
+    // Replace each channel's key (its text includes the name, so drop any old spelling first)
     for (int i = 0; i < 12; i++) {
         char val[32];
-        char *key = preset_key_for_channel(kf, name, i);
-        if (!key && label_group) key = preset_key_for_channel(kf, label_group, i);
-        if (!key) key = g_strdup_printf("ch%d", i);
+        char *old = preset_key_for_channel(kf, name, i);
+        if (old) {
+            g_key_file_remove_key(kf, name, old, NULL);
+            g_free(old);
+        }
+        char *key = key_for_channel(i, gtk_editable_get_text(GTK_EDITABLE(pd->all->channel_names[i])));
         double v = snap_and_clamp(atof(gtk_editable_get_text(GTK_EDITABLE(pd->all->entry_boxes[i]))));
         snprintf(val, sizeof(val), "%.4f", v);
         g_key_file_set_value(kf, name, key, val);
         g_free(key);
     }
-    g_strfreev(groups);
 
     GError *err = NULL;
     if (g_key_file_save_to_file(kf, PRESET_FILE, &err)) {
@@ -1251,7 +1279,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(vbox), grid);
  
     GtkWidget       *entry_boxes[12];
-    GtkWidget       *channel_labels[12];
+    GtkWidget       *channel_names[12];
     GtkToggleButton *off_buttons[12];
     BtnCallbackData *off_cb_data_arr[12]; // one BtnCallbackData* per off button
     GtkWidget       *update_buttons[12];
@@ -1260,9 +1288,19 @@ static void activate(GtkApplication *app, gpointer user_data) {
         char label_text[32];
         snprintf(label_text, sizeof(label_text), "Channel %d:", i);
         GtkWidget *label = gtk_label_new(label_text);
-        gtk_widget_set_halign(label, GTK_ALIGN_END);
-        gtk_grid_attach(GTK_GRID(grid), label, 0, i, 1, 1);
-        channel_labels[i] = label;
+
+        // Editable channel name; saved with presets as "chN (name)"
+        GtkWidget *name_entry = gtk_entry_new();
+        g_object_set(name_entry, "placeholder-text", "name", NULL);
+        gtk_editable_set_width_chars(GTK_EDITABLE(name_entry), 12);
+        gtk_entry_set_max_length(GTK_ENTRY(name_entry), 24);
+        channel_names[i] = name_entry;
+
+        GtkWidget *name_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_box_append(GTK_BOX(name_box), label);
+        gtk_box_append(GTK_BOX(name_box), name_entry);
+        gtk_widget_set_halign(name_box, GTK_ALIGN_END);
+        gtk_grid_attach(GTK_GRID(grid), name_box, 0, i, 1, 1);
 
         GtkWidget *entry = gtk_entry_new();
         apply_value(GTK_ENTRY(entry), 0.0);
@@ -1325,7 +1363,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
         all_data->off_buttons[i]    = off_buttons[i];
         all_data->off_data[i]       = off_cb_data_arr[i];
         all_data->entry_boxes[i]    = entry_boxes[i];
-        all_data->channel_labels[i] = channel_labels[i];
+        all_data->channel_names[i]  = channel_names[i];
     }
 
     g_signal_connect(all_off_btn,    "clicked", G_CALLBACK(on_alloff_clicked),    all_data);
@@ -1348,6 +1386,10 @@ static void activate(GtkApplication *app, gpointer user_data) {
     preset_data->name_entry = gtk_entry_new();
     g_object_set(preset_data->name_entry, "placeholder-text", "New preset name", NULL);
     gtk_widget_set_hexpand(preset_data->name_entry, TRUE);
+
+    char *preset_tip = g_strdup_printf("Preset file: %s", preset_file());
+    gtk_widget_set_tooltip_text(GTK_WIDGET(preset_data->dropdown), preset_tip);
+    g_free(preset_tip);
 
     GtkWidget *preset_load_btn = gtk_button_new_with_label("Load");
     GtkWidget *preset_send_btn = gtk_button_new_with_label("Load & Send");
