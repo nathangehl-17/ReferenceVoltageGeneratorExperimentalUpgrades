@@ -18,6 +18,9 @@ gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm && 
 #  include <fcntl.h>
 #  include <termios.h>
 #  include <unistd.h>
+#  ifdef __APPLE__
+#    include <glob.h>
+#  endif
    typedef int serial_fd_t;
 #  define SERIAL_INVALID (-1)
 #endif
@@ -712,6 +715,19 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_set_halign(com_label, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(conn_box), com_label);
 
+#ifdef __APPLE__
+    // macOS names USB serial devices /dev/cu.usbmodem*, /dev/cu.usbserial*, etc.
+    // Scan for the ones currently attached, then fall back to a placeholder.
+    glob_t gl = {0};
+    glob("/dev/cu.usbmodem*", 0, NULL, &gl);
+    glob("/dev/cu.usbserial*", GLOB_APPEND, NULL, &gl);
+    glob("/dev/cu.SLAB_USBtoUART*", GLOB_APPEND, NULL, &gl);
+    const char *com_ports[gl.gl_pathc + 2];
+    for (size_t i = 0; i < gl.gl_pathc; i++) com_ports[i] = gl.gl_pathv[i];
+    if (gl.gl_pathc == 0) com_ports[0] = "/dev/cu.usbmodem1101";
+    com_ports[gl.gl_pathc ? gl.gl_pathc : 1] = NULL;
+    const guint default_port = 0;
+#else
     const char *com_ports[] = {
         "COM1", "COM2", "COM3", "COM4",
         "COM5", "COM6", "COM7", "COM8",
@@ -719,10 +735,14 @@ static void activate(GtkApplication *app, gpointer user_data) {
         "/dev/ttyACM0", "/dev/ttyACM1",
         NULL
     };
+    const guint default_port = 10; // /dev/ttyACM0
+#endif
     GtkStringList *com_list = gtk_string_list_new(com_ports);
+#ifdef __APPLE__
+    globfree(&gl);
+#endif
     GtkWidget *com_dropdown = gtk_drop_down_new(G_LIST_MODEL(com_list), NULL);
-    // Default to /dev/ttyACM0 (index 10)
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(com_dropdown), 10);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(com_dropdown), default_port);
     gtk_box_append(GTK_BOX(conn_box), com_dropdown);
 
     GtkWidget *baud_label = gtk_label_new("Baud Rate:");
