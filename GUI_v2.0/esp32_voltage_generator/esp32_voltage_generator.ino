@@ -14,8 +14,9 @@ Flash command:
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // SPI pin definitions
-#define NANO_CS_PIN 5 // chip select
+#define NANO_CS_PIN 12 // chip select (pins 5/6 are Bank 1 I2C)
 #define RST_PIN 11 // reset
+#define RST_ACTIVE_LEVEL HIGH // PSEC6 RESET: pull high, then low (design doc section 6, Clock Test)
 
 // ── I2C bus pin definitions ───────────────────────────────────────────────────
 #define BANK0_SDA 3
@@ -34,7 +35,7 @@ TwoWire* const i2cHW[2] = { &Wire, &Wire1 };
 const uint8_t DAC_ADDR[4] = { 0x48, 0x49, 0x4A, 0x4B };
 
 // ── DAC70501 registers ────────────────────────────────────────────────────────
-const uint8_t REG_SYNC = 0x01;    //0x01;
+const uint8_t REG_SYNC = 0x02;    // 0x01 is the read-only DEVID register
 const uint8_t REG_CONFIG = 0x03;  //0x02;
 const uint8_t REG_GAIN = 0x04;
 const uint8_t REG_TRIGGER = 0x05;
@@ -185,6 +186,10 @@ void setup() {
   // SPI CS lines are active LOW; keep it HIGH to start deselected
   digitalWrite(NANO_CS_PIN, HIGH);
 
+  // Reset line idles inactive
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, !RST_ACTIVE_LEVEL);
+
   // Initialize the main SPI bus
   SPI.begin();
 
@@ -237,77 +242,126 @@ void setup() {
 // =============================================================================
 //  SPI communication
 // =============================================================================
-void sendDataToNano(byte data) {
+const uint8_t SPI_MAX_BYTES = 8;
+
+// Sends `count` bytes in one chip-select assertion and prints each byte shifted
+// back as "RX: XX" for the GUI.
+void spiTransfer(const uint8_t *data, uint8_t count) {
   // Send data at 1MHz, MSBFIRST, SPI_MODE0
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-
-  // Select the Nano
   digitalWrite(NANO_CS_PIN, LOW);
 
-  // Print the Nano's acknowledgement 0xF1
-  uint8_t response_from_nano = SPI.transfer(data);
-  //Serial.print("Response from Nano: 0x");
-  //Serial.println(response_from_nano, HEX);
-  
-  // These commands will be read by the GUI
-  Serial.print("Received: "); // receiver
-  Serial.println(response_from_nano, HEX); // newline after each byte
+  for (uint8_t i = 0; i < count; i++) {
+    uint8_t rx = SPI.transfer(data[i]);
+    Serial.print("RX: ");
+    Serial.println(rx, HEX); // newline after each byte
+  }
 
-  // Deselect the Nano
   digitalWrite(NANO_CS_PIN, HIGH);
-
   SPI.endTransaction();
 }
 
+// Pulses the chip RESET pin
+void pulseReset() {
+  digitalWrite(RST_PIN, RST_ACTIVE_LEVEL);
+  delay(1);
+  digitalWrite(RST_PIN, !RST_ACTIVE_LEVEL);
+}
+
 // =============================================================================
-//  Main loop
+//  Command handling
 // =============================================================================
+// Every GUI command starts with a command byte:
+//   CMD_DAC: 00 bank dac_addr reg value_hi value_lo   (6 bytes)
+//   CMD_RST: 01 00                                    (2 bytes)
+//   CMD_SPI: 02 count byte0 .. byte(count-1)          (2 + count bytes)
+const uint8_t CMD_DAC = 0x00;
+const uint8_t CMD_RST = 0x01;
+const uint8_t CMD_SPI = 0x02;
 
-const uint8_t MSG_LEN = 5; // expecting 5 bytes
-uint8_t msg_buf[MSG_LEN];
+void showDacUpdate(uint8_t channel, uint8_t reg, uint16_t code) {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(3);
 
-void loop() {
+  // Row 1: DAC number, plus ON/OFF when this was a power-down write
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(0, 20);
+  tft.print("DAC: ");
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(channel);
 
-  if (Serial.available() >= MSG_LEN) { // waiting for 5 bytes to arrive
-    Serial.readBytes(msg_buf, MSG_LEN);
-
-    uint8_t bank = msg_buf[0];
-    uint8_t chip = msg_buf[1];
-    uint8_t reg = msg_buf[2];
-    uint8_t high = msg_buf[3];
-    uint8_t low = msg_buf[4];
-    uint16_t code = ((uint16_t)high << 8) | low;
-    dacWriteReg(bank, chip, REG_DAC, code);
-
-    // Update TFT
-    tft.fillScreen(ST77XX_BLACK);
-    tft.setTextSize(3);
-
-    // Row 1: DAC Number
-    tft.setTextColor(ST77XX_CYAN);
-    tft.setCursor(0, 20);
-    tft.print("DAC: ");
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print(bank * chip);
-
-    if ((reg == 0x03) && (code == 0x0001)) {
+  if (reg == REG_CONFIG) {
+    if (code & 0x0001) {
       tft.setTextColor(ST77XX_RED);
       tft.println(" OFF");
-    } else if ((reg == 0x02) && (code == 0x0000)) {
+    } else {
       tft.setTextColor(ST77XX_GREEN);
       tft.println(" ON");
     }
+  }
 
-    // Row 2: Voltage
-    float voltage = codeToVoltage(code);
+  // Row 2: Voltage (only meaningful for a DAC data write)
+  if (reg == REG_DAC) {
     tft.setTextColor(ST77XX_CYAN);
     tft.setCursor(0, 70);
     tft.println("VOLTAGE:");
     tft.setTextColor(ST77XX_WHITE);
     tft.setCursor(0, 100);
-    tft.print(voltage, 4);
+    tft.print(codeToVoltage(code), 4);
     tft.print(" V");
-    
   }
+}
 
+void handleDacCommand(const uint8_t *msg) {
+  uint8_t bank = msg[1];
+  uint8_t addr = msg[2];
+  uint8_t reg = msg[3];
+  uint16_t code = ((uint16_t)msg[4] << 8) | msg[5];
+
+  uint8_t chip = addr - DAC_ADDR[0];
+  if (bank >= NUM_BANKS || addr < DAC_ADDR[0] || chip >= DACS_PER_BANK) return; // malformed
+  if (reg != REG_SYNC && reg != REG_CONFIG && reg != REG_GAIN && reg != REG_TRIGGER && reg != REG_DAC) return;
+
+  dacWriteReg(bank, chip, reg, code);
+  showDacUpdate(bank * DACS_PER_BANK + chip, reg, code);
+}
+
+void handleSpiCommand(const uint8_t *msg) {
+  spiTransfer(&msg[2], msg[1]);
+}
+
+const uint8_t MAX_MSG_LEN = 2 + SPI_MAX_BYTES;
+
+void loop() {
+  static uint8_t msg[MAX_MSG_LEN];
+  static uint8_t have = 0; // bytes of the current message received so far
+  static uint8_t need = 0; // total length of the current message (0 = not known yet)
+
+  while (Serial.available()) {
+    uint8_t b = Serial.read();
+
+    if (have == 0) {
+      if (b == CMD_DAC) need = 6;
+      else if (b == CMD_RST) need = 2;
+      else if (b == CMD_SPI) need = 0; // length comes from the count byte
+      else continue; // not a command byte, drop it to resynchronize
+    }
+    msg[have++] = b;
+
+    if (have == 2 && msg[0] == CMD_SPI) {
+      if (b == 0 || b > SPI_MAX_BYTES) { // bad count, drop the message
+        have = 0;
+        continue;
+      }
+      need = 2 + b;
+    }
+
+    if (need != 0 && have == need) {
+      if (msg[0] == CMD_DAC) handleDacCommand(msg);
+      else if (msg[0] == CMD_RST) pulseReset();
+      else handleSpiCommand(msg);
+      have = 0;
+      need = 0;
+    }
+  }
 }

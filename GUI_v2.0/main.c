@@ -30,7 +30,7 @@ gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm && 
 #define VOLTAGE_STEP  0.0001   /* 100 µV */
 
 // DAC70501 registers
-const uint8_t REG_SYNC = 0x01;
+const uint8_t REG_SYNC = 0x02;
 const uint8_t REG_CONFIG = 0x03;
 const uint8_t REG_GAIN = 0x04;
 const uint8_t REG_TRIGGER = 0x05;
@@ -505,6 +505,10 @@ typedef struct {
 // Global pointer to background listeners
 static IncomingDataWidgets *global_rx_widgets = NULL;
 
+// Which "Bytes Received" label gets the next byte (0-2). Reset on every SPI send so a
+// reply always starts at Byte 0. Atomic because the Windows reader runs on its own thread.
+static gint rx_byte_index = 0;
+
 // Send button callback depends on which radio button is selected
 static void on_send_clicked(GtkButton *button, gpointer user_data) {
     RadioBtnSelect *data = (RadioBtnSelect *)user_data;
@@ -573,6 +577,7 @@ static void on_send_clicked(GtkButton *button, gpointer user_data) {
     }
     g_print("\n");
 
+    g_atomic_int_set(&rx_byte_index, 0);
     send_bytes(msg, msg_len);
 }
 
@@ -645,21 +650,18 @@ static gboolean on_serial_data_available(GIOChannel *source, GIOCondition condit
 
             // Tokenize by newline to catch "RX: <byte>" lines
             char *line = strtok(buf, "\n");
-            static int byte_index = 0; // Tracks which label to update (0, 1, or 2)
 
             while (line != NULL) {
                 unsigned int hex_val;
                 // Parse the expected format: "RX: <byte>" (e.g., "RX: 0xAA" or "RX: AA")
                 if (sscanf(line, "RX: %x", &hex_val) == 1 || sscanf(line, "RX: 0x%x", &hex_val) == 1) {
+                    int byte_index = g_atomic_int_get(&rx_byte_index);
                     if (global_rx_widgets && byte_index < 3) {
                         char markup[64];
                         snprintf(markup, sizeof(markup), "<b>0x%02X</b>", hex_val);
                         gtk_label_set_markup(GTK_LABEL(global_rx_widgets->received_labels[byte_index]), markup);
 
-                        byte_index++;
-                        if (byte_index >= 3) {
-                            byte_index = 0; // Reset after filling all 3 bytes
-                        }
+                        g_atomic_int_set(&rx_byte_index, (byte_index + 1) % 3);
                     }
                 }
                 line = strtok(NULL, "\n");
@@ -719,7 +721,6 @@ static gpointer windows_serial_thread_func(gpointer user_data) {
 
     char rx_buf[512];
     DWORD bytes_read;
-    int byte_index = 0;
 
     while (!g_atomic_int_get(&win_reader_stop)) {
         if (!ReadFile(hPort, rx_buf, sizeof(rx_buf) - 1, &bytes_read, NULL)) {
@@ -734,6 +735,7 @@ static gpointer windows_serial_thread_func(gpointer user_data) {
                 unsigned int hex_val;
                 if (sscanf(line, "RX: %x", &hex_val) == 1 || sscanf(line, "RX: 0x%x", &hex_val) == 1) {
 
+                    int byte_index = g_atomic_int_get(&rx_byte_index);
                     UpdatePayload *payload = g_new(UpdatePayload, 1);
                     payload->index = byte_index;
                     payload->val = hex_val;
@@ -741,8 +743,7 @@ static gpointer windows_serial_thread_func(gpointer user_data) {
                     // Pass the named function instead of the lambda
                     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, update_rx_label_cb, payload, NULL);
 
-                    byte_index++;
-                    if (byte_index >= 3) byte_index = 0;
+                    g_atomic_int_set(&rx_byte_index, (byte_index + 1) % 3);
                 }
                 line = strtok(NULL, "\n");
             }
@@ -891,23 +892,22 @@ static void set_toggle_silently(GtkToggleButton *tb, BtnCallbackData *off_data, 
     g_signal_handlers_unblock_by_func(tb, G_CALLBACK(on_off_clicked), off_data);
 }
 
-// Change toggle buttons' state to 'off'
-static void on_alloff_clicked(GtkButton *button, gpointer user_data) {
-    AllBtnData *data = (AllBtnData *)user_data;
-    for (int i=0; i<12; i++) {
-        gtk_toggle_button_set_active(data->off_buttons[i], FALSE);
-        set_off_button_visual(GTK_WIDGET(data->off_buttons[i]), FALSE);
+// Powers every channel on or off: sends the DAC power-down write, then updates the toggle.
+// Does nothing (buttons keep their state) if the write can't be sent.
+static void set_all_power(AllBtnData *data, gboolean is_on) {
+    if (!require_connection()) return;
+    for (int i = 0; i < 12; i++) {
+        if (!send_voltage_command(REG_CONFIG, i, is_on ? 0x0000 : 0x0001)) return;
+        set_toggle_silently(data->off_buttons[i], data->off_data[i], is_on);
     }
-    
 }
 
-// Change toggle buttons' state to 'on'
+static void on_alloff_clicked(GtkButton *button, gpointer user_data) {
+    set_all_power((AllBtnData *)user_data, FALSE);
+}
+
 static void on_allon_clicked(GtkButton *button, gpointer user_data) {
-    AllBtnData *data = (AllBtnData *)user_data;
-    for (int i=0; i<12; i++) {
-        gtk_toggle_button_set_active(data->off_buttons[i], TRUE);
-        set_off_button_visual(GTK_WIDGET(data->off_buttons[i]), TRUE);
-    }
+    set_all_power((AllBtnData *)user_data, TRUE);
 }
 
 // Opens the serial port and sends a voltage command for every channel
@@ -924,6 +924,131 @@ static void on_updateall_clicked(GtkButton *button, gpointer user_data) {
 
         if (!send_voltage_command(REG_DAC, i, v)) return; //data->channel_values[i]
     }
+}
+
+// Presets: named sets of channel voltages kept in PRESET_FILE (GKeyFile format), e.g.
+//   [Smoke Test]
+//   ch0=1.2
+//   ch5=2.5
+// Channels a preset doesn't list are left alone. Edit the file by hand or use "Save current".
+#define PRESET_FILE "presets.ini"
+
+typedef struct {
+    AllBtnData  *all;
+    GtkDropDown *dropdown;
+    GtkWidget   *name_entry;
+} PresetData;
+
+static GKeyFile *presets_open(void) {
+    GKeyFile *kf = g_key_file_new();
+    // A missing file just means no presets yet
+    g_key_file_load_from_file(kf, PRESET_FILE, G_KEY_FILE_KEEP_COMMENTS, NULL);
+    return kf;
+}
+
+// Rebuilds the preset dropdown from the file, selecting `select_name` if it exists
+static void presets_reload(PresetData *pd, const char *select_name) {
+    GKeyFile *kf = presets_open();
+    gsize n = 0;
+    gchar **groups = g_key_file_get_groups(kf, &n);
+    GtkStringList *list = GTK_STRING_LIST(gtk_drop_down_get_model(pd->dropdown));
+    gtk_string_list_splice(list, 0, g_list_model_get_n_items(G_LIST_MODEL(list)),
+                           (const char *const *)groups);
+    for (gsize i = 0; select_name && i < n; i++) {
+        if (strcmp(groups[i], select_name) == 0) {
+            gtk_drop_down_set_selected(pd->dropdown, (guint)i);
+            break;
+        }
+    }
+    g_strfreev(groups);
+    g_key_file_free(kf);
+}
+
+// Fills the voltage entries from the selected preset; with `send`, also powers those
+// channels on and writes their voltages to the board.
+static void preset_apply(PresetData *pd, gboolean send) {
+    GtkStringObject *sel = GTK_STRING_OBJECT(gtk_drop_down_get_selected_item(pd->dropdown));
+    if (!sel) {
+        set_status("No preset selected. Add one to %s or use Save current.", PRESET_FILE);
+        return;
+    }
+    if (send && !require_connection()) return;
+
+    char *name = g_strdup(gtk_string_object_get_string(sel));
+    GKeyFile *kf = presets_open();
+    gboolean present[12] = { FALSE };
+    int loaded = 0;
+
+    for (int i = 0; i < 12; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "ch%d", i);
+        if (!g_key_file_has_key(kf, name, key, NULL)) continue;
+        GError *err = NULL;
+        double v = g_key_file_get_double(kf, name, key, &err);
+        if (err) {
+            set_status("Preset \"%s\": bad value for %s", name, key);
+            g_error_free(err);
+            goto done; // don't send a half-read preset
+        }
+        apply_value(GTK_ENTRY(pd->all->entry_boxes[i]), v);
+        present[i] = TRUE;
+        loaded++;
+    }
+
+    if (send) {
+        for (int i = 0; i < 12; i++) {
+            if (!present[i]) continue;
+            double v = atof(gtk_editable_get_text(GTK_EDITABLE(pd->all->entry_boxes[i])));
+            if (!send_voltage_command(REG_CONFIG, i, 0x0000) ||  // DAC power on
+                !send_voltage_command(REG_DAC, i, voltageToCode(v)))
+                goto done;
+            set_toggle_silently(pd->all->off_buttons[i], pd->all->off_data[i], TRUE);
+        }
+    }
+    set_status("Preset \"%s\": %d channels %s", name, loaded, send ? "sent" : "loaded (not sent)");
+
+done:
+    g_key_file_free(kf);
+    g_free(name);
+}
+
+static void on_preset_load_clicked(GtkButton *button, gpointer user_data) {
+    preset_apply((PresetData *)user_data, FALSE);
+}
+
+static void on_preset_send_clicked(GtkButton *button, gpointer user_data) {
+    preset_apply((PresetData *)user_data, TRUE);
+}
+
+// Stores the current voltage entries under the name typed in the preset name box
+static void on_preset_save_clicked(GtkButton *button, gpointer user_data) {
+    PresetData *pd = (PresetData *)user_data;
+    char *name = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(pd->name_entry))));
+    if (name[0] == '\0' || strpbrk(name, "[]") || g_ascii_iscntrl(name[0])) {
+        set_status("Type a preset name (no square brackets) to save.");
+        g_free(name);
+        return;
+    }
+
+    GKeyFile *kf = presets_open();
+    for (int i = 0; i < 12; i++) {
+        char key[16], val[32];
+        snprintf(key, sizeof(key), "ch%d", i);
+        double v = snap_and_clamp(atof(gtk_editable_get_text(GTK_EDITABLE(pd->all->entry_boxes[i]))));
+        snprintf(val, sizeof(val), "%.4f", v);
+        g_key_file_set_value(kf, name, key, val);
+    }
+
+    GError *err = NULL;
+    if (g_key_file_save_to_file(kf, PRESET_FILE, &err)) {
+        set_status("Saved preset \"%s\" to %s", name, PRESET_FILE);
+        presets_reload(pd, name);
+    } else {
+        set_status("Could not write %s: %s", PRESET_FILE, err->message);
+        g_error_free(err);
+    }
+    g_key_file_free(kf);
+    g_free(name);
 }
 
 // When the byte entry value is changed, check if it's a valid hex value
@@ -957,10 +1082,53 @@ gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval,
 	return FALSE; // Accept the valid hex character
 }
 
+// Dark theme: black and grey, with purple used sparingly (focus, selection, ON state, checks).
+// Named buttons (btn-on / btn-off) come from set_off_button_visual().
+static const char *const THEME_CSS =
+    "window, scrolledwindow, viewport { background-color: #0f0f10; color: #d8d8dc; }\n"
+    "label { color: #d8d8dc; }\n"
+    "separator { background-color: #2e2e33; min-height: 1px; }\n"
+    "entry { background: #1c1c20; color: #e8e8ec; border: 1px solid #2e2e33; border-radius: 6px;"
+    "       caret-color: #a58ee6; padding: 4px 8px; }\n"
+    "entry:focus-within { border-color: #8b6fd6; box-shadow: none; }\n"
+    "entry selection { background-color: #4a3d78; color: #ffffff; }\n"
+    "button { background: #1c1c20; color: #d8d8dc; border: 1px solid #2e2e33; border-radius: 6px;"
+    "        box-shadow: none; text-shadow: none; padding: 4px 12px; }\n"
+    "button:hover { background: #26262b; border-color: #4a4a52; }\n"
+    "button:active { background: #2e2e33; }\n"
+    "button:disabled { color: #5c5c64; }\n"
+    "button#btn-on { background: #1f1b2e; border-color: #6f58b8; color: #c9bdf0; }\n"
+    "button#btn-on:hover { background: #262138; }\n"
+    "button#btn-off { background: #151517; border-color: #2e2e33; color: #6e6e76; }\n"
+    "dropdown button { background: #1c1c20; }\n"
+    "popover contents, popover arrow { background: #17171a; color: #d8d8dc; border: 1px solid #2e2e33; }\n"
+    "popover row:hover { background: #26262b; }\n"
+    "popover row:selected { background: #2e2e33; }\n"
+    "check { background: #1c1c20; border: 1px solid #3a3a40; }\n"
+    "check:checked { background: #6f58b8; border-color: #8b6fd6; color: #ffffff; }\n"
+    "scrollbar slider { background: #34343a; border-radius: 6px; min-width: 8px; min-height: 8px; }\n"
+    "scrollbar slider:hover { background: #4a4a52; }\n";
+
+static void apply_theme(void) {
+    GtkSettings *settings = gtk_settings_get_default();
+    if (settings) g_object_set(settings, "gtk-application-prefer-dark-theme", TRUE, NULL);
+
+    GtkCssProvider *provider = gtk_css_provider_new();
+#if GTK_CHECK_VERSION(4, 12, 0)
+    gtk_css_provider_load_from_string(provider, THEME_CSS);
+#else
+    gtk_css_provider_load_from_data(provider, THEME_CSS, -1);
+#endif
+    gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+        GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(provider);
+}
+
 // Initialize GUI widgets inside activate
 static void activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *window;
-    
+
+    apply_theme();
     window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Reference Voltage Generator");
     g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), NULL);
@@ -970,6 +1138,8 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
+    // Open as wide as the widest row (the preset row), not a hardcoded width
+    gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(scroll), TRUE);
     gtk_window_set_child(GTK_WINDOW(window), scroll);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
@@ -1074,7 +1244,10 @@ static void activate(GtkApplication *app, gpointer user_data) {
         gtk_grid_attach(GTK_GRID(grid), down_btn, 3, i, 1, 1);
 
         // column 4: power off channel
-        GtkToggleButton *off_btn = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("OFF"));
+        // The firmware powers every DAC on at startup, so the button starts as ON
+        GtkToggleButton *off_btn = GTK_TOGGLE_BUTTON(gtk_toggle_button_new_with_label("ON"));
+        gtk_toggle_button_set_active(off_btn, TRUE);
+        set_off_button_visual(GTK_WIDGET(off_btn), TRUE);
         gtk_widget_set_tooltip_text(GTK_WIDGET(off_btn), "Set channel to 0 V");
         BtnCallbackData *off_cb_data = make_btn_data(i, entry_boxes[i], conn_data);
         g_signal_connect(off_btn, "clicked", G_CALLBACK(on_off_clicked), off_cb_data);
@@ -1090,7 +1263,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
         update_buttons[i] = update_btn;
     }
 
-    gtk_window_set_default_size(GTK_WINDOW(window), 680, 950);
+    gtk_window_set_default_size(GTK_WINDOW(window), -1, 950);
     gtk_window_present(GTK_WINDOW(window));
 
     // power off all channels, power on all channels, update all channels
@@ -1120,6 +1293,33 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(all_box), all_on_btn);
     gtk_box_append(GTK_BOX(all_box), all_update_btn);
     gtk_box_append(GTK_BOX(vbox), all_box);
+
+    // Preset row: pick a saved preset to load or send, or save the current values
+    PresetData *preset_data = g_new0(PresetData, 1);
+    preset_data->all = all_data;
+    preset_data->dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(NULL)), NULL));
+    preset_data->name_entry = gtk_entry_new();
+    g_object_set(preset_data->name_entry, "placeholder-text", "New preset name", NULL);
+    gtk_widget_set_hexpand(preset_data->name_entry, TRUE);
+
+    GtkWidget *preset_load_btn = gtk_button_new_with_label("Load");
+    GtkWidget *preset_send_btn = gtk_button_new_with_label("Load & Send");
+    GtkWidget *preset_save_btn = gtk_button_new_with_label("Save current");
+    gtk_widget_set_tooltip_text(preset_load_btn, "Fill the voltage boxes without sending");
+    gtk_widget_set_tooltip_text(preset_send_btn, "Fill the voltage boxes, power the channels on and send them");
+    g_signal_connect(preset_load_btn, "clicked", G_CALLBACK(on_preset_load_clicked), preset_data);
+    g_signal_connect(preset_send_btn, "clicked", G_CALLBACK(on_preset_send_clicked), preset_data);
+    g_signal_connect(preset_save_btn, "clicked", G_CALLBACK(on_preset_save_clicked), preset_data);
+
+    GtkWidget *preset_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(preset_box), gtk_label_new("Preset:"));
+    gtk_box_append(GTK_BOX(preset_box), GTK_WIDGET(preset_data->dropdown));
+    gtk_box_append(GTK_BOX(preset_box), preset_load_btn);
+    gtk_box_append(GTK_BOX(preset_box), preset_send_btn);
+    gtk_box_append(GTK_BOX(preset_box), preset_data->name_entry);
+    gtk_box_append(GTK_BOX(preset_box), preset_save_btn);
+    gtk_box_append(GTK_BOX(vbox), preset_box);
+    presets_reload(preset_data, NULL);
 	
 	// SPI Communication section
 	GtkWidget *sep2 = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
