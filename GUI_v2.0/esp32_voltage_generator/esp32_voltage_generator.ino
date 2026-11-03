@@ -174,6 +174,50 @@ float codeToVoltage(uint16_t code) {
 }
 
 // =============================================================================
+//  Level-shifter rails (two SN74LVC245A, one fixed each way), driven by DAC ch 9-11
+// =============================================================================
+// ch 11 = 0 V: GND of both chips, DIR of the RX chip (low = B->A), both OE pins (low = enabled)
+// ch 10 = 2.5 V: VCC of the TX chip (Feather -> chip), also its DIR (high = A->B)
+// ch 9  = 3.3 V: VCC of the RX chip (chip -> Feather)
+const uint16_t LS_GND_CODE = 0;
+const uint16_t LS_TX_VCC_CODE = 0x8000; // 2.5 V
+const uint16_t LS_RX_VCC_CODE = 43254;  // 3.3 V
+
+void levelShifterInit() {
+  dacWriteReg(2, 3, REG_DAC, LS_GND_CODE);
+  dacWriteReg(2, 2, REG_DAC, LS_TX_VCC_CODE);
+  dacWriteReg(2, 1, REG_DAC, LS_RX_VCC_CODE);
+}
+
+// =============================================================================
+//  Trigger-out input (arrives through the RX level shifter on an adjustable pin)
+// =============================================================================
+volatile uint32_t trigCount = 0;
+volatile uint32_t trigMillis = 0;
+int8_t trigPin = -1; // -1 = disabled
+
+void IRAM_ATTR trigIsr() {
+  trigCount++;
+  trigMillis = millis();
+}
+
+// Only the Feather's free logic pins: D13 and A0-A5. (5, 6, 9-12 are the I2C banks, RESET and
+// chip select, and the SPI pins are taken.)
+bool trigPinAllowed(uint8_t pin) {
+  return pin == 13 || pin == A0 || pin == A1 || pin == A2 || pin == A3 || pin == A4 || pin == A5;
+}
+
+// pin 0 disables the trigger input
+void setTrigPin(uint8_t pin) {
+  if (trigPin >= 0) detachInterrupt(trigPin);
+  trigPin = -1;
+  if (pin == 0 || !trigPinAllowed(pin)) return;
+  pinMode(pin, INPUT);
+  attachInterrupt(pin, trigIsr, RISING);
+  trigPin = pin;
+}
+
+// =============================================================================
 //  Setup
 // =============================================================================
 
@@ -234,6 +278,9 @@ void setup() {
     }
   }
 
+  // Bring up the level-shifter rails so SPI and trigger work without the GUI
+  levelShifterInit();
+
   tft.fillScreen(ST77XX_BLACK);
   tft.setCursor(0, 0);
   tft.println("Ready to receive.");
@@ -275,9 +322,11 @@ void pulseReset() {
 //   CMD_DAC: 00 bank dac_addr reg value_hi value_lo   (6 bytes)
 //   CMD_RST: 01 00                                    (2 bytes)
 //   CMD_SPI: 02 count byte0 .. byte(count-1)          (2 + count bytes)
+//   CMD_TRIG: 03 pin  (GPIO for trigger-out, 0 = disabled)  (2 bytes)
 const uint8_t CMD_DAC = 0x00;
 const uint8_t CMD_RST = 0x01;
 const uint8_t CMD_SPI = 0x02;
+const uint8_t CMD_TRIG = 0x03;
 
 void showDacUpdate(uint8_t channel, uint8_t reg, uint16_t code) {
   tft.fillScreen(ST77XX_BLACK);
@@ -336,6 +385,16 @@ void loop() {
   static uint8_t msg[MAX_MSG_LEN];
   static uint8_t have = 0; // bytes of the current message received so far
   static uint8_t need = 0; // total length of the current message (0 = not known yet)
+  static uint32_t trigReported = 0;
+
+  uint32_t count = trigCount;
+  if (count != trigReported) {
+    trigReported = count;
+    Serial.print("TRIG: ");
+    Serial.print(count);
+    Serial.print(" ");
+    Serial.println(trigMillis);
+  }
 
   while (Serial.available()) {
     uint8_t b = Serial.read();
@@ -343,6 +402,7 @@ void loop() {
     if (have == 0) {
       if (b == CMD_DAC) need = 6;
       else if (b == CMD_RST) need = 2;
+      else if (b == CMD_TRIG) need = 2;
       else if (b == CMD_SPI) need = 0; // length comes from the count byte
       else continue; // not a command byte, drop it to resynchronize
     }
@@ -359,6 +419,7 @@ void loop() {
     if (need != 0 && have == need) {
       if (msg[0] == CMD_DAC) handleDacCommand(msg);
       else if (msg[0] == CMD_RST) pulseReset();
+      else if (msg[0] == CMD_TRIG) setTrigPin(msg[1]);
       else handleSpiCommand(msg);
       have = 0;
       need = 0;

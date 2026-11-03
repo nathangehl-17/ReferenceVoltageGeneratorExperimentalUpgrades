@@ -47,6 +47,14 @@ const uint8_t DAC_ADDR[4] = {0x48, 0x49, 0x4A, 0x4B};
 const uint8_t DAC_CMD_START = 0x00; // writing voltage value to a DAC
 const uint8_t RST_CMD_START = 0x01; // pulling down Reset pin
 const uint8_t SPI_CMD_START = 0x02; // writing SPI command
+const uint8_t TRIG_CMD_START = 0x03; // choosing the GPIO that watches trigger-out (0 = disabled)
+
+// Channels 0-8 are experiment voltages. 9-11 power the two level-shifter chips and are
+// kept out of the channel grid, the All buttons and presets.
+#define NUM_USER_CHANNELS 9
+#define LS_CH_RX_VCC  9   // VCC of the RX chip (chip -> Feather), 3.3 V
+#define LS_CH_TX_VCC  10  // VCC of the TX chip (Feather -> chip) and its DIR, 2.5 V
+#define LS_CH_GND     11  // GND of both chips, RX DIR and both OE pins, 0 V
 
 uint16_t voltageToCode(float v) {
   if (v <= 0.0f) return 0x0000;
@@ -501,10 +509,73 @@ static BtnCallbackData *make_btn_data(int ch, GtkWidget *entry, ConnectData *con
 // Struct to hold widgets that display received SPI data
 typedef struct {
     GtkWidget *received_labels[3];
+    GtkTextBuffer *log_buffer;  // every byte received, one per line
+    GtkWidget *log_view;
+    GtkWidget *trig_count_label;
+    GtkWidget *trig_time_label;
+    GtkWidget *trig_indicator;
+    guint trig_flash_id;        // pending timeout that clears the indicator
 } IncomingDataWidgets;
 
 // Global pointer to background listeners
 static IncomingDataWidgets *global_rx_widgets = NULL;
+
+// Main-thread only. Shows a received SPI byte in the 3 labels (when index < 3) and the log.
+static void ui_show_rx_byte(int index, unsigned int val) {
+    if (!global_rx_widgets) return;
+    char markup[64];
+    snprintf(markup, sizeof(markup), "<b>0x%02X</b>", val);
+    if (index >= 0 && index < 3)
+        gtk_label_set_markup(GTK_LABEL(global_rx_widgets->received_labels[index]), markup);
+
+    if (global_rx_widgets->log_buffer) {
+        char line[16];
+        snprintf(line, sizeof(line), "0x%02X\n", val);
+        GtkTextIter end;
+        gtk_text_buffer_get_end_iter(global_rx_widgets->log_buffer, &end);
+        gtk_text_buffer_insert(global_rx_widgets->log_buffer, &end, line, -1);
+
+        // Keep the log bounded
+        if (gtk_text_buffer_get_line_count(global_rx_widgets->log_buffer) > 500) {
+            GtkTextIter start, cut;
+            gtk_text_buffer_get_start_iter(global_rx_widgets->log_buffer, &start);
+            gtk_text_buffer_get_iter_at_line(global_rx_widgets->log_buffer, &cut, 100);
+            gtk_text_buffer_delete(global_rx_widgets->log_buffer, &start, &cut);
+        }
+        gtk_text_buffer_get_end_iter(global_rx_widgets->log_buffer, &end);
+        GtkTextMark *mark = gtk_text_buffer_create_mark(global_rx_widgets->log_buffer, NULL, &end, FALSE);
+        gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(global_rx_widgets->log_view), mark, 0.0, FALSE, 0.0, 0.0);
+        gtk_text_buffer_delete_mark(global_rx_widgets->log_buffer, mark);
+    }
+}
+
+static gboolean trig_flash_off_cb(gpointer data) {
+    if (global_rx_widgets) {
+        gtk_label_set_markup(GTK_LABEL(global_rx_widgets->trig_indicator), "<span foreground=\"gray\">&#9679;</span>");
+        global_rx_widgets->trig_flash_id = 0;
+    }
+    return FALSE;
+}
+
+// Main-thread only. `ms` is the Feather's millis() at the last trigger.
+static void ui_show_trigger(unsigned int count, unsigned int ms) {
+    if (!global_rx_widgets) return;
+    char text[48];
+    snprintf(text, sizeof(text), "%u", count);
+    gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_count_label), text);
+    snprintf(text, sizeof(text), "%.3f s (board uptime)", ms / 1000.0);
+    gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_time_label), text);
+    gtk_label_set_markup(GTK_LABEL(global_rx_widgets->trig_indicator), "<span foreground=\"#2ecc71\">&#9679;</span>");
+    if (global_rx_widgets->trig_flash_id) g_source_remove(global_rx_widgets->trig_flash_id);
+    global_rx_widgets->trig_flash_id = g_timeout_add(300, trig_flash_off_cb, NULL);
+}
+
+// Parses one line from the board ("RX: XX" or "TRIG: count ms"). Returns 1 for RX (val set), 2 for TRIG.
+static int parse_board_line(const char *line, unsigned int *a, unsigned int *b) {
+    if (sscanf(line, "RX: %x", a) == 1 || sscanf(line, "RX: 0x%x", a) == 1) return 1;
+    if (sscanf(line, "TRIG: %u %u", a, b) == 2) return 2;
+    return 0;
+}
 
 // Which "Bytes Received" label gets the next byte (0-2). Reset on every SPI send so a
 // reply always starts at Byte 0. Atomic because the Windows reader runs on its own thread.
@@ -653,17 +724,14 @@ static gboolean on_serial_data_available(GIOChannel *source, GIOCondition condit
             char *line = strtok(buf, "\n");
 
             while (line != NULL) {
-                unsigned int hex_val;
-                // Parse the expected format: "RX: <byte>" (e.g., "RX: 0xAA" or "RX: AA")
-                if (sscanf(line, "RX: %x", &hex_val) == 1 || sscanf(line, "RX: 0x%x", &hex_val) == 1) {
+                unsigned int a = 0, b = 0;
+                int kind = parse_board_line(line, &a, &b);
+                if (kind == 1) {
                     int byte_index = g_atomic_int_get(&rx_byte_index);
-                    if (global_rx_widgets && byte_index < 3) {
-                        char markup[64];
-                        snprintf(markup, sizeof(markup), "<b>0x%02X</b>", hex_val);
-                        gtk_label_set_markup(GTK_LABEL(global_rx_widgets->received_labels[byte_index]), markup);
-
-                        g_atomic_int_set(&rx_byte_index, (byte_index + 1) % 3);
-                    }
+                    ui_show_rx_byte(byte_index, a);
+                    g_atomic_int_set(&rx_byte_index, (byte_index + 1) % 3);
+                } else if (kind == 2) {
+                    ui_show_trigger(a, b);
                 }
                 line = strtok(NULL, "\n");
             }
@@ -684,18 +752,17 @@ static gboolean on_serial_data_available(GIOChannel *source, GIOCondition condit
 
 // Forward-declare the payload struct at file scope so both functions can see it
 typedef struct {
+    int kind;         // 1 = RX byte (index, a = value), 2 = trigger (a = count, b = ms)
     int index;
-    unsigned int val;
+    unsigned int a;
+    unsigned int b;
 } UpdatePayload;
 
 // Named idle callback — replaces the C++ lambda
 static gboolean update_rx_label_cb(gpointer data) {
     UpdatePayload *p = (UpdatePayload *)data;
-    if (global_rx_widgets) {
-        char markup[64];
-        snprintf(markup, sizeof(markup), "<b>0x%02X</b>", p->val);
-        gtk_label_set_markup(GTK_LABEL(global_rx_widgets->received_labels[p->index]), markup);
-    }
+    if (p->kind == 1) ui_show_rx_byte(p->index, p->a);
+    else ui_show_trigger(p->a, p->b);
     g_free(p);
     return FALSE; // Run once
 }
@@ -733,18 +800,20 @@ static gpointer windows_serial_thread_func(gpointer user_data) {
 
             char *line = strtok(rx_buf, "\n");
             while (line != NULL) {
-                unsigned int hex_val;
-                if (sscanf(line, "RX: %x", &hex_val) == 1 || sscanf(line, "RX: 0x%x", &hex_val) == 1) {
-
+                unsigned int a = 0, b = 0;
+                int kind = parse_board_line(line, &a, &b);
+                if (kind) {
                     int byte_index = g_atomic_int_get(&rx_byte_index);
                     UpdatePayload *payload = g_new(UpdatePayload, 1);
+                    payload->kind = kind;
                     payload->index = byte_index;
-                    payload->val = hex_val;
+                    payload->a = a;
+                    payload->b = b;
 
                     // Pass the named function instead of the lambda
                     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, update_rx_label_cb, payload, NULL);
 
-                    g_atomic_int_set(&rx_byte_index, (byte_index + 1) % 3);
+                    if (kind == 1) g_atomic_int_set(&rx_byte_index, (byte_index + 1) % 3);
                 }
                 line = strtok(NULL, "\n");
             }
@@ -754,6 +823,78 @@ static gpointer windows_serial_thread_func(gpointer user_data) {
     return NULL;
 }
 #endif
+
+// Trigger-out GPIO dropdown ("Disabled" or a pin number); the pin is sent to the board on change and on connect
+static GtkDropDown *trig_dropdown = NULL;
+
+// Free logic pins on the Feather (pins 5, 6, 9-12 are the I2C banks, RESET and chip select).
+// Dropdown entry 0 is "Disabled"; entry i is TRIG_PIN_NAMES[i-1] on GPIO TRIG_PIN_GPIO[i-1].
+static const char *const TRIG_PIN_NAMES[] = {"D13", "A0", "A1", "A2", "A3", "A4", "A5"};
+static const uint8_t TRIG_PIN_GPIO[] = {13, 18, 17, 16, 15, 14, 8};
+#define NUM_TRIG_PINS 7
+
+static void send_trigger_pin(void) {
+    if (!trig_dropdown || serial_is_invalid(active_serial_fd)) return;
+    guint sel = gtk_drop_down_get_selected(trig_dropdown);
+    if (sel == GTK_INVALID_LIST_POSITION || sel > NUM_TRIG_PINS) return;
+    uint8_t pin = sel == 0 ? 0 : TRIG_PIN_GPIO[sel - 1]; // 0 = disabled
+    uint8_t msg[2] = {TRIG_CMD_START, pin};
+    g_print("Trigger-out pin: %u\n", pin);
+    send_bytes(msg, sizeof(msg));
+}
+
+static void on_trig_pin_changed(GObject *obj, GParamSpec *pspec, gpointer user_data) {
+    send_trigger_pin();
+}
+
+// "Poll POCI": clocks one 0x00 byte out every interval so whatever the chip shifts back on POCI
+// shows up in the log
+static GtkWidget *poll_toggle = NULL;
+static guint poll_source_id = 0;
+
+static gboolean poll_poci_cb(gpointer data) {
+    if (serial_is_invalid(active_serial_fd)) {
+        poll_source_id = 0;
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(poll_toggle), FALSE);
+        return FALSE;
+    }
+    uint8_t msg[3] = {SPI_CMD_START, 1, 0x00};
+    send_bytes(msg, sizeof(msg));
+    return TRUE;
+}
+
+static void on_poll_toggled(GtkToggleButton *button, gpointer user_data) {
+    if (poll_source_id) {
+        g_source_remove(poll_source_id);
+        poll_source_id = 0;
+    }
+    if (gtk_toggle_button_get_active(button)) {
+        if (!require_connection()) {
+            gtk_toggle_button_set_active(button, FALSE);
+            return;
+        }
+        poll_source_id = g_timeout_add(100, poll_poci_cb, NULL);
+    }
+}
+
+// Level-shifter rails: entries in the order GND, TX VCC, RX VCC
+typedef struct {
+    GtkWidget *entries[3];
+} LevelShiftData;
+
+static const int    LS_CHANNELS[3] = {LS_CH_GND, LS_CH_TX_VCC, LS_CH_RX_VCC};
+static const double LS_DEFAULTS[3] = {0.0, 2.5, 3.3};
+
+// Resets the three entries to their defaults and writes them to the board
+static void on_ls_defaults_clicked(GtkButton *button, gpointer user_data) {
+    LevelShiftData *ls = (LevelShiftData *)user_data;
+    for (int i = 0; i < 3; i++)
+        apply_value(GTK_ENTRY(ls->entries[i]), LS_DEFAULTS[i]);
+    if (!require_connection()) return;
+    for (int i = 0; i < 3; i++) {
+        if (!send_voltage_command(REG_DAC, LS_CHANNELS[i], voltageToCode(LS_DEFAULTS[i]))) return;
+    }
+}
 
 // Human-readable reason the last open_serial() failed, with a fix where we know one
 static const char *serial_open_error(char *buf, size_t n) {
@@ -814,6 +955,7 @@ static gboolean connect_serial(ConnectData *data) {
 
     set_status("Connected: %s @ %s baud", port, baud);
     g_print("Port %s opened successfully and listening.\n", port);
+    send_trigger_pin();
     g_free(port);
     return TRUE;
 }
@@ -897,7 +1039,7 @@ static void set_toggle_silently(GtkToggleButton *tb, BtnCallbackData *off_data, 
 // Does nothing (buttons keep their state) if the write can't be sent.
 static void set_all_power(AllBtnData *data, gboolean is_on) {
     if (!require_connection()) return;
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         if (!send_voltage_command(REG_CONFIG, i, is_on ? 0x0000 : 0x0001)) return;
         set_toggle_silently(data->off_buttons[i], data->off_data[i], is_on);
     }
@@ -918,7 +1060,7 @@ static void on_updateall_clicked(GtkButton *button, gpointer user_data) {
     if (!require_connection()) return;
 
     // Send one command per channel over the single open connection
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         GtkEntry *entry = GTK_ENTRY(data->entry_boxes[i]);
         double value    = atof(gtk_editable_get_text(GTK_EDITABLE(entry)));
         uint16_t v = voltageToCode(value);
@@ -1034,7 +1176,7 @@ static void preset_apply(PresetData *pd, gboolean send) {
     gboolean present[12] = { FALSE };
     int loaded = 0;
 
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         char *key = preset_key_for_channel(kf, name, i);
         if (!key) continue;
         GError *err = NULL;
@@ -1055,7 +1197,7 @@ static void preset_apply(PresetData *pd, gboolean send) {
     }
 
     if (send) {
-        for (int i = 0; i < 12; i++) {
+        for (int i = 0; i < NUM_USER_CHANNELS; i++) {
             if (!present[i]) continue;
             double v = atof(gtk_editable_get_text(GTK_EDITABLE(pd->all->entry_boxes[i])));
             if (!send_voltage_command(REG_CONFIG, i, 0x0000) ||  // DAC power on
@@ -1091,7 +1233,7 @@ static void on_preset_save_clicked(GtkButton *button, gpointer user_data) {
 
     GKeyFile *kf = presets_open();
     // Replace each channel's key (its text includes the name, so drop any old spelling first)
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         char val[32];
         char *old = preset_key_for_channel(kf, name, i);
         if (old) {
@@ -1284,7 +1426,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     BtnCallbackData *off_cb_data_arr[12]; // one BtnCallbackData* per off button
     GtkWidget       *update_buttons[12];
 
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         char label_text[32];
         snprintf(label_text, sizeof(label_text), "Channel %d:", i);
         GtkWidget *label = gtk_label_new(label_text);
@@ -1359,7 +1501,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
      * the per-channel widgets and the shared serial dropdowns. */
     AllBtnData *all_data = g_new0(AllBtnData, 1);
     all_data->conn = conn_data;
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         all_data->off_buttons[i]    = off_buttons[i];
         all_data->off_data[i]       = off_cb_data_arr[i];
         all_data->entry_boxes[i]    = entry_boxes[i];
@@ -1410,6 +1552,56 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(vbox), preset_box);
     presets_reload(preset_data, NULL);
 	
+    // Level Shifters section: channels 9-11 power the two 245 chips (see README)
+    GtkWidget *sep_ls = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_widget_set_margin_top(sep_ls, 8);
+    gtk_widget_set_margin_bottom(sep_ls, 8);
+    gtk_box_append(GTK_BOX(vbox), sep_ls);
+
+    GtkWidget *ls_title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(ls_title), "<b>Level Shifters</b>");
+    gtk_box_append(GTK_BOX(vbox), ls_title);
+
+    GtkWidget *ls_note = gtk_label_new("Channels 9-11 power the SPI level-shifter chips. Changing these changes the chip's signal levels.");
+    gtk_box_append(GTK_BOX(vbox), ls_note);
+
+    const char *ls_names[3] = {
+        "GND / RX DIR / OE (ch 11)",
+        "TX VCC / TX DIR (ch 10)",
+        "RX VCC (ch 9)"
+    };
+    LevelShiftData *ls_data = g_new0(LevelShiftData, 1);
+    GtkWidget *ls_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(ls_grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(ls_grid), 8);
+    for (int i = 0; i < 3; i++) {
+        GtkWidget *name = gtk_label_new(ls_names[i]);
+        gtk_widget_set_halign(name, GTK_ALIGN_END);
+        gtk_grid_attach(GTK_GRID(ls_grid), name, 0, i, 1, 1);
+
+        GtkWidget *entry = gtk_entry_new();
+        apply_value(GTK_ENTRY(entry), LS_DEFAULTS[i]);
+        gtk_entry_set_input_purpose(GTK_ENTRY(entry), GTK_INPUT_PURPOSE_NUMBER);
+        gtk_widget_set_hexpand(entry, TRUE);
+        g_signal_connect(entry, "activate", G_CALLBACK(on_entry_activate), NULL);
+        GtkEventController *focus = gtk_event_controller_focus_new();
+        g_signal_connect(focus, "leave", G_CALLBACK(on_entry_focus_leave), entry);
+        gtk_widget_add_controller(entry, focus);
+        gtk_grid_attach(GTK_GRID(ls_grid), entry, 1, i, 1, 1);
+        ls_data->entries[i] = entry;
+
+        GtkWidget *apply_btn = gtk_button_new_with_label("APPLY");
+        g_signal_connect(apply_btn, "clicked", G_CALLBACK(on_update_clicked),
+                         make_btn_data(LS_CHANNELS[i], entry, conn_data));
+        gtk_grid_attach(GTK_GRID(ls_grid), apply_btn, 2, i, 1, 1);
+    }
+    gtk_box_append(GTK_BOX(vbox), ls_grid);
+
+    GtkWidget *ls_defaults_btn = gtk_button_new_with_label("Apply defaults (0 / 2.5 / 3.3 V)");
+    gtk_widget_set_halign(ls_defaults_btn, GTK_ALIGN_END);
+    g_signal_connect(ls_defaults_btn, "clicked", G_CALLBACK(on_ls_defaults_clicked), ls_data);
+    gtk_box_append(GTK_BOX(vbox), ls_defaults_btn);
+
 	// SPI Communication section
 	GtkWidget *sep2 = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
 	gtk_widget_set_margin_top(sep2, 8);
@@ -1582,6 +1774,56 @@ static void activate(GtkApplication *app, gpointer user_data) {
         // Save to global reference
         global_rx_widgets->received_labels[i] = received_byte;
     }
+
+    // POCI log: every byte received, newest at the bottom; "Poll POCI" keeps clocking bytes in
+    poll_toggle = gtk_toggle_button_new_with_label("Poll POCI");
+    gtk_widget_set_tooltip_text(poll_toggle, "Clock a 0x00 byte out every 100 ms and log what comes back on POCI");
+    g_signal_connect(poll_toggle, "toggled", G_CALLBACK(on_poll_toggled), NULL);
+    gtk_widget_set_halign(poll_toggle, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(vbox), poll_toggle);
+
+    GtkWidget *log_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(log_view), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(log_view), FALSE);
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(log_view), TRUE);
+    GtkWidget *log_scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(log_scroll), log_view);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(log_scroll), 100);
+    gtk_box_append(GTK_BOX(vbox), log_scroll);
+    global_rx_widgets->log_view = log_view;
+    global_rx_widgets->log_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(log_view));
+
+    // Trigger-out section: the pin the board watches for trigger-out (arrives via the RX level shifter)
+    GtkWidget *sep_trig = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_widget_set_margin_top(sep_trig, 8);
+    gtk_widget_set_margin_bottom(sep_trig, 8);
+    gtk_box_append(GTK_BOX(vbox), sep_trig);
+
+    GtkWidget *trig_title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(trig_title), "<b>Trigger Out</b>");
+    gtk_box_append(GTK_BOX(vbox), trig_title);
+
+    const char *trig_pins[NUM_TRIG_PINS + 2] = {"Disabled"};
+    for (int i = 0; i < NUM_TRIG_PINS; i++) trig_pins[i + 1] = TRIG_PIN_NAMES[i];
+    trig_pins[NUM_TRIG_PINS + 1] = NULL;
+    trig_dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(trig_pins)), NULL));
+    g_signal_connect(trig_dropdown, "notify::selected", G_CALLBACK(on_trig_pin_changed), NULL);
+
+    global_rx_widgets->trig_count_label = gtk_label_new("0");
+    global_rx_widgets->trig_time_label = gtk_label_new("none yet");
+    global_rx_widgets->trig_indicator = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(global_rx_widgets->trig_indicator), "<span foreground=\"gray\">&#9679;</span>");
+
+    GtkWidget *trig_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_halign(trig_box, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(trig_box), gtk_label_new("Pin"));
+    gtk_box_append(GTK_BOX(trig_box), GTK_WIDGET(trig_dropdown));
+    gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_indicator);
+    gtk_box_append(GTK_BOX(trig_box), gtk_label_new("Count:"));
+    gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_count_label);
+    gtk_box_append(GTK_BOX(trig_box), gtk_label_new("Last:"));
+    gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_time_label);
+    gtk_box_append(GTK_BOX(vbox), trig_box);
 }
 
 int main(int argc, char *argv[]) {

@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="960" viewBox="0 0 1500 960" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#222"/></marker>
+  </defs>
+  <rect width="1500" height="960" fill="#ffffff"/>
+  <text x="750" y="36" font-size="26" font-weight="bold" text-anchor="middle" fill="#111">Reference Voltage Generator: SPI / Trigger Level-Shifter Wiring</text>
+
+  <!-- Feather -->
+  <rect x="40" y="90" width="300" height="780" rx="10" fill="#eaf2fb" stroke="#2c5d93" stroke-width="3"/>
+  <text x="190" y="125" font-size="22" font-weight="bold" text-anchor="middle" fill="#1d3f66">Feather ESP32-S3</text>
+  <text x="190" y="150" font-size="15" text-anchor="middle" fill="#1d3f66">3.3 V logic</text>
+  <text x="326" y="206" font-size="16" text-anchor="end" fill="#111">SCK  GPIO36</text>
+  <text x="326" y="266" font-size="16" text-anchor="end" fill="#111">MOSI  GPIO35</text>
+  <text x="326" y="326" font-size="16" text-anchor="end" fill="#111">CS  GPIO12</text>
+  <text x="326" y="666" font-size="16" text-anchor="end" fill="#111">MISO  GPIO37</text>
+  <text x="326" y="746" font-size="16" text-anchor="end" fill="#111">Trigger in  D13 or A0-A5</text>
+  <text x="326" y="766" font-size="13" text-anchor="end" fill="#555">(chosen in the GUI)</text>
+  <text x="60" y="820" font-size="13" fill="#333">DAC ch 9-11 (bank 2, I2C on GPIO 9/10)</text>
+  <text x="60" y="838" font-size="13" fill="#333">supply every rail shown in color.</text>
+
+  <!-- TX 245 -->
+  <rect x="600" y="130" width="240" height="260" rx="8" fill="#fdf3e7" stroke="#b9650f" stroke-width="3"/>
+  <text x="720" y="165" font-size="20" font-weight="bold" text-anchor="middle" fill="#7a410a">TX 245 (SN74LVC245A)</text>
+  <text x="720" y="188" font-size="14" text-anchor="middle" fill="#7a410a">A to B (Feather to chip)</text>
+  <text x="720" y="370" font-size="14" text-anchor="middle" fill="#7a410a">VCC 2.5 V</text>
+
+  <!-- RX 245 -->
+  <rect x="600" y="590" width="240" height="260" rx="8" fill="#f3eaf8" stroke="#6c3483" stroke-width="3"/>
+  <text x="720" y="625" font-size="20" font-weight="bold" text-anchor="middle" fill="#4a235a">RX 245 (SN74LVC245A)</text>
+  <text x="720" y="648" font-size="14" text-anchor="middle" fill="#4a235a">B to A (chip to Feather)</text>
+  <text x="720" y="830" font-size="14" text-anchor="middle" fill="#4a235a">VCC 3.3 V</text>
+
+  <!-- Chip -->
+  <rect x="1160" y="90" width="300" height="780" rx="10" fill="#eaf7ee" stroke="#1e8449" stroke-width="3"/>
+  <text x="1310" y="125" font-size="22" font-weight="bold" text-anchor="middle" fill="#145a32">PSEC chip</text>
+  <text x="1310" y="150" font-size="15" text-anchor="middle" fill="#145a32">2.5 V logic</text>
+  <text x="1174" y="206" font-size="16" fill="#111">SCK</text>
+  <text x="1174" y="266" font-size="16" fill="#111">PICO</text>
+  <text x="1174" y="326" font-size="16" fill="#111">CS</text>
+  <text x="1174" y="666" font-size="16" fill="#111">POCI</text>
+  <text x="1174" y="746" font-size="16" fill="#111">Trigger out</text>
+
+  <!-- TX signal wires: Feather -> TX A, TX B -> chip -->
+  <g stroke="#222" stroke-width="3" fill="none" marker-end="url(#arr)">
+    <line x1="340" y1="200" x2="598" y2="200"/>
+    <line x1="340" y1="260" x2="598" y2="260"/>
+    <line x1="340" y1="320" x2="598" y2="320"/>
+    <line x1="842" y1="200" x2="1158" y2="200"/>
+    <line x1="842" y1="260" x2="1158" y2="260"/>
+    <line x1="842" y1="320" x2="1158" y2="320"/>
+  </g>
+  <!-- RX signal wires: chip -> RX B, RX A -> Feather -->
+  <g stroke="#222" stroke-width="3" fill="none" marker-end="url(#arr)">
+    <line x1="1158" y1="660" x2="842" y2="660"/>
+    <line x1="1158" y1="740" x2="842" y2="740"/>
+    <line x1="598" y1="660" x2="342" y2="660"/>
+    <line x1="598" y1="740" x2="342" y2="740"/>
+  </g>
+  <g font-size="14" fill="#333" text-anchor="middle">
+    <text x="470" y="192">SCK</text><text x="470" y="252">MOSI</text><text x="470" y="312">CS</text>
+    <text x="1000" y="192">SCK</text><text x="1000" y="252">PICO</text><text x="1000" y="312">CS</text>
+    <text x="1000" y="652">POCI</text><text x="1000" y="732">Trigger out</text>
+    <text x="470" y="652">MISO</text><text x="470" y="732">Trigger</text>
+  </g>
+  <text x="470" y="90" font-size="15" fill="#555" text-anchor="middle">3.3 V side</text>
+  <text x="1000" y="90" font-size="15" fill="#555" text-anchor="middle">2.5 V side</text>
+
+  <!-- TX power / control stubs (VCC, DIR on top; GND, OE below) -->
+  <g stroke-width="4" fill="none">
+    <line x1="650" y1="130" x2="650" y2="85" stroke="#e67e22"/>
+    <line x1="790" y1="130" x2="790" y2="85" stroke="#e67e22"/>
+    <line x1="650" y1="390" x2="650" y2="435" stroke="#7f8c8d"/>
+    <line x1="790" y1="390" x2="790" y2="435" stroke="#7f8c8d"/>
+  </g>
+  <g font-size="14" font-weight="bold" text-anchor="middle">
+    <text x="650" y="60" fill="#e67e22">VCC</text><text x="650" y="76" fill="#e67e22">ch 10 (2.5 V)</text>
+    <text x="790" y="60" fill="#e67e22">DIR</text><text x="790" y="76" fill="#e67e22">ch 10 (high, A to B)</text>
+    <text x="650" y="463" fill="#7f8c8d">GND</text><text x="650" y="479" fill="#7f8c8d">ch 11 (0 V)</text>
+    <text x="790" y="463" fill="#7f8c8d">OE</text><text x="790" y="479" fill="#7f8c8d">ch 11 (low, enabled)</text>
+  </g>
+
+  <!-- RX power / control stubs -->
+  <g stroke-width="4" fill="none">
+    <line x1="650" y1="590" x2="650" y2="545" stroke="#8e44ad"/>
+    <line x1="790" y1="590" x2="790" y2="545" stroke="#7f8c8d"/>
+    <line x1="650" y1="850" x2="650" y2="895" stroke="#7f8c8d"/>
+    <line x1="790" y1="850" x2="790" y2="895" stroke="#7f8c8d"/>
+  </g>
+  <g font-size="14" font-weight="bold" text-anchor="middle">
+    <text x="650" y="520" fill="#8e44ad">VCC</text><text x="650" y="536" fill="#8e44ad">ch 9 (3.3 V)</text>
+    <text x="790" y="520" fill="#7f8c8d">DIR</text><text x="790" y="536" fill="#7f8c8d">ch 11 (low, B to A)</text>
+    <text x="650" y="923" fill="#7f8c8d">GND</text><text x="650" y="939" fill="#7f8c8d">ch 11 (0 V)</text>
+    <text x="790" y="923" fill="#7f8c8d">OE</text><text x="790" y="939" fill="#7f8c8d">ch 11 (low, enabled)</text>
+  </g>
+
+  <!-- Legend -->
+  <g font-size="14" fill="#111">
+    <rect x="40" y="890" width="16" height="16" fill="#7f8c8d"/><text x="64" y="903">ch 11: 0 V (GND, RX DIR, both OE)</text>
+    <rect x="40" y="912" width="16" height="16" fill="#e67e22"/><text x="64" y="925">ch 10: 2.5 V (TX VCC and DIR)</text>
+    <rect x="300" y="912" width="16" height="16" fill="#8e44ad"/><text x="324" y="925">ch 9: 3.3 V (RX VCC)</text>
+  </g>
+</svg>

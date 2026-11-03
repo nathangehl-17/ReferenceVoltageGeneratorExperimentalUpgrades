@@ -171,6 +171,30 @@ Each row in the table indicates which pins to connect together. SCK on the Feath
 ![Arduino Nano pinout](images/figure7.png)
 *Figure 6. Arduino Nano pinout.*
 
+## GUI v2.0: Level Shifters, Trigger Out and POCI Read-back
+[Jump to Top](#reference-voltage-generator)
+
+The chip's signals are 2.5 V but the Feather's inputs are 3.3 V logic (input-high is about 2.5 V, which is marginal), so the signals pass through two SN74LVC245A level shifters, each fixed in one direction:
+- **TX chip** (Feather to chip): SCK, PICO (from Feather MOSI), CS. Runs at 2.5 V.
+- **RX chip** (chip to Feather): POCI (to the Feather MISO pin, GPIO37) and trigger-out (to an adjustable GPIO). Runs at 3.3 V.
+
+The chips' power and control pins come from DAC channels 9-11. Channels 0-8 remain experiment voltages. Channels 9-11 do not appear in the channel grid, and All OFF / All UPDATE / presets never touch them. The firmware sets them at boot, and the **Level Shifters** section of the GUI can change them.
+
+| Channel | Default | Connect to |
+| :--- | :--- | :--- |
+| 11 | 0 V | GND of both 245s, DIR of the RX chip (low = B to A), and OE of both chips (low = enabled) |
+| 10 | 2.5 V | VCC of the TX chip and its DIR (high = A to B; A side is the Feather) |
+| 9 | 3.3 V | VCC of the RX chip |
+
+![Level shifter wiring diagram](images/level_shifter_wiring.png)
+*Figure 8. Wiring between the Feather, the two level-shifter chips and the PSEC chip.*
+
+Caution: the DAC70501 has limited output drive, and channel 11 acting as GND must sink the current of both chips' outputs. Check the datasheet limits, and use a real ground with channel 11 only on DIR/OE if the rails sag.
+
+**Trigger Out:** pick the pin the trigger-out line is wired to in the **Trigger Out** section (D13 or A0-A5, or Disabled; these are GPIO 13, 18, 17, 16, 15, 14 and 8). D13 shares its pin with the on-board LED. The Feather counts rising edges and the GUI shows the count, the board-uptime time of the last trigger and a flashing indicator. The other logic pins (5, 6, 9, 10, 11, 12) are already used for the I2C banks, RESET and chip select, so they are not offered.
+
+**POCI:** every byte clocked back on POCI is added to the log under **Bytes Received**. Press **Poll POCI** to clock a 0x00 byte out every 100 ms and log what returns.
+
 ## Known Issues
 [Jump to Top](#reference-voltage-generator)
 
