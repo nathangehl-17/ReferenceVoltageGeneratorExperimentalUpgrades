@@ -513,8 +513,12 @@ typedef struct {
     GtkWidget *log_view;
     GtkWidget *trig_count_label;
     GtkWidget *trig_time_label;
+    GtkWidget *trig_ago_label;
     GtkWidget *trig_indicator;
     guint trig_flash_id;        // pending timeout that clears the indicator
+    guint trig_tick_id;         // timeout that refreshes the "seconds ago" readout
+    gint64 trig_recv_us;        // g_get_monotonic_time() when the last trigger arrived (0 = none yet)
+    unsigned int trig_ms;       // board uptime (millis) of the last trigger
 } IncomingDataWidgets;
 
 // Global pointer to background listeners
@@ -557,14 +561,42 @@ static gboolean trig_flash_off_cb(gpointer data) {
     return FALSE;
 }
 
+// Shows the last trigger as board uptime and as seconds since it arrived here
+static void update_trig_time_label(void) {
+    if (!global_rx_widgets || global_rx_widgets->trig_recv_us == 0) return;
+    double ago = (g_get_monotonic_time() - global_rx_widgets->trig_recv_us) / 1e6;
+    char text[64];
+    snprintf(text, sizeof(text), "%.3f s board uptime,", global_rx_widgets->trig_ms / 1000.0);
+    gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_time_label), text);
+    snprintf(text, sizeof(text), "%.1f s ago", ago);
+    gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_ago_label), text);
+}
+
+static gboolean trig_tick_cb(gpointer data) {
+    update_trig_time_label();
+    return TRUE;
+}
+
+// Main-thread only. Clears the trigger readout (new pin selected, or a new connection).
+static void ui_reset_trigger(void) {
+    if (!global_rx_widgets || !global_rx_widgets->trig_count_label) return;
+    global_rx_widgets->trig_recv_us = 0;
+    gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_count_label), "0");
+    gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_time_label), "none yet");
+    gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_ago_label), "");
+}
+
 // Main-thread only. `ms` is the Feather's millis() at the last trigger.
 static void ui_show_trigger(unsigned int count, unsigned int ms) {
     if (!global_rx_widgets) return;
     char text[48];
     snprintf(text, sizeof(text), "%u", count);
     gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_count_label), text);
-    snprintf(text, sizeof(text), "%.3f s (board uptime)", ms / 1000.0);
-    gtk_label_set_text(GTK_LABEL(global_rx_widgets->trig_time_label), text);
+    global_rx_widgets->trig_ms = ms;
+    global_rx_widgets->trig_recv_us = g_get_monotonic_time();
+    update_trig_time_label();
+    if (!global_rx_widgets->trig_tick_id)
+        global_rx_widgets->trig_tick_id = g_timeout_add(100, trig_tick_cb, NULL);
     gtk_label_set_markup(GTK_LABEL(global_rx_widgets->trig_indicator), "<span foreground=\"#2ecc71\">&#9679;</span>");
     if (global_rx_widgets->trig_flash_id) g_source_remove(global_rx_widgets->trig_flash_id);
     global_rx_widgets->trig_flash_id = g_timeout_add(300, trig_flash_off_cb, NULL);
@@ -834,7 +866,9 @@ static const uint8_t TRIG_PIN_GPIO[] = {13, 18, 17, 16, 15, 14, 8};
 #define NUM_TRIG_PINS 7
 
 static void send_trigger_pin(void) {
-    if (!trig_dropdown || serial_is_invalid(active_serial_fd)) return;
+    if (!trig_dropdown) return; // the UI isn't built yet; activate() calls this again once it is
+    ui_reset_trigger(); // the board restarts its count whenever it gets this command
+    if (serial_is_invalid(active_serial_fd)) return;
     guint sel = gtk_drop_down_get_selected(trig_dropdown);
     if (sel == GTK_INVALID_LIST_POSITION || sel > NUM_TRIG_PINS) return;
     uint8_t pin = sel == 0 ? 0 : TRIG_PIN_GPIO[sel - 1]; // 0 = disabled
@@ -1809,8 +1843,22 @@ static void activate(GtkApplication *app, gpointer user_data) {
     trig_dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(trig_pins)), NULL));
     g_signal_connect(trig_dropdown, "notify::selected", G_CALLBACK(on_trig_pin_changed), NULL);
 
+    // Readout labels are monospace, left-aligned and reserve room for their widest expected text,
+    // so nothing in the row moves as the numbers change (the ago value fits 5 digits + 1 decimal)
     global_rx_widgets->trig_count_label = gtk_label_new("0");
     global_rx_widgets->trig_time_label = gtk_label_new("none yet");
+    global_rx_widgets->trig_ago_label = gtk_label_new("");
+    GtkWidget *readouts[3] = {global_rx_widgets->trig_count_label, global_rx_widgets->trig_time_label,
+                              global_rx_widgets->trig_ago_label};
+    const int readout_width[3] = {7, 28, 13}; // "9999999", "4294967.295 s board uptime,", "99999.9 s ago"
+    PangoAttrList *mono = pango_attr_list_new();
+    pango_attr_list_insert(mono, pango_attr_family_new("monospace"));
+    for (int i = 0; i < 3; i++) {
+        gtk_label_set_attributes(GTK_LABEL(readouts[i]), mono);
+        gtk_label_set_width_chars(GTK_LABEL(readouts[i]), readout_width[i]);
+        gtk_label_set_xalign(GTK_LABEL(readouts[i]), 0.0f);
+    }
+    pango_attr_list_unref(mono);
     global_rx_widgets->trig_indicator = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(global_rx_widgets->trig_indicator), "<span foreground=\"gray\">&#9679;</span>");
 
@@ -1823,7 +1871,12 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_count_label);
     gtk_box_append(GTK_BOX(trig_box), gtk_label_new("Last:"));
     gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_time_label);
+    gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_ago_label);
     gtk_box_append(GTK_BOX(vbox), trig_box);
+
+    // The launch-time auto-connect ran before this dropdown existed, so tell the board now
+    // (otherwise it keeps whatever pin was selected in the last session)
+    send_trigger_pin();
 }
 
 int main(int argc, char *argv[]) {

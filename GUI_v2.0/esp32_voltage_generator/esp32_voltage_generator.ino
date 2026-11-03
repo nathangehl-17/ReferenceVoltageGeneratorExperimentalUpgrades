@@ -194,6 +194,7 @@ void levelShifterInit() {
 // =============================================================================
 volatile uint32_t trigCount = 0;
 volatile uint32_t trigMillis = 0;
+uint32_t trigReported = 0; // last count printed to the GUI
 int8_t trigPin = -1; // -1 = disabled
 
 void IRAM_ATTR trigIsr() {
@@ -211,8 +212,11 @@ bool trigPinAllowed(uint8_t pin) {
 void setTrigPin(uint8_t pin) {
   if (trigPin >= 0) detachInterrupt(trigPin);
   trigPin = -1;
+  trigCount = 0; // every selection (and every GUI connect) starts a fresh count
+  trigMillis = 0;
+  trigReported = 0;
   if (pin == 0 || !trigPinAllowed(pin)) return;
-  pinMode(pin, INPUT);
+  pinMode(pin, INPUT_PULLDOWN); // a floating input picks up noise and false-triggers
   attachInterrupt(pin, trigIsr, RISING);
   trigPin = pin;
 }
@@ -385,7 +389,6 @@ void loop() {
   static uint8_t msg[MAX_MSG_LEN];
   static uint8_t have = 0; // bytes of the current message received so far
   static uint8_t need = 0; // total length of the current message (0 = not known yet)
-  static uint32_t trigReported = 0;
 
   uint32_t count = trigCount;
   if (count != trigReported) {
