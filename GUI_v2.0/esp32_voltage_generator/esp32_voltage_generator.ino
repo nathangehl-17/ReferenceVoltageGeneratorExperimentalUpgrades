@@ -10,6 +10,7 @@ Flash command:
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
+#include <esp_timer.h>
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
@@ -197,9 +198,20 @@ volatile uint32_t trigMillis = 0;
 uint32_t trigReported = 0; // last count printed to the GUI
 int8_t trigPin = -1; // -1 = disabled
 
+// Debounce: a wire touched to a source (or a noisy line) chatters, producing many rising edges
+// in a burst. An edge only counts if no edge was seen in the previous trigHoldoffUs, and every
+// edge restarts that quiet period, so a whole burst counts once.
+volatile uint32_t trigHoldoffUs = 50000;
+volatile int64_t trigLastEdgeUs = 0;
+
 void IRAM_ATTR trigIsr() {
-  trigCount++;
-  trigMillis = millis();
+  int64_t now = esp_timer_get_time();
+  bool quiet = (now - trigLastEdgeUs) >= (int64_t)trigHoldoffUs;
+  trigLastEdgeUs = now;
+  if (quiet) {
+    trigCount++;
+    trigMillis = millis();
+  }
 }
 
 // Only the Feather's free logic pins: D13 and A0-A5. (5, 6, 9-12 are the I2C banks, RESET and
@@ -208,13 +220,15 @@ bool trigPinAllowed(uint8_t pin) {
   return pin == 13 || pin == A0 || pin == A1 || pin == A2 || pin == A3 || pin == A4 || pin == A5;
 }
 
-// pin 0 disables the trigger input
-void setTrigPin(uint8_t pin) {
+// pin 0 disables the trigger input; holdoffMs is the debounce quiet period (0 = count every edge)
+void setTrigPin(uint8_t pin, uint16_t holdoffMs) {
   if (trigPin >= 0) detachInterrupt(trigPin);
   trigPin = -1;
   trigCount = 0; // every selection (and every GUI connect) starts a fresh count
   trigMillis = 0;
   trigReported = 0;
+  trigHoldoffUs = (uint32_t)holdoffMs * 1000UL;
+  trigLastEdgeUs = esp_timer_get_time() - (int64_t)trigHoldoffUs; // so the first edge counts
   if (pin == 0 || !trigPinAllowed(pin)) return;
   pinMode(pin, INPUT_PULLDOWN); // a floating input picks up noise and false-triggers
   attachInterrupt(pin, trigIsr, RISING);
@@ -326,7 +340,7 @@ void pulseReset() {
 //   CMD_DAC: 00 bank dac_addr reg value_hi value_lo   (6 bytes)
 //   CMD_RST: 01 00                                    (2 bytes)
 //   CMD_SPI: 02 count byte0 .. byte(count-1)          (2 + count bytes)
-//   CMD_TRIG: 03 pin  (GPIO for trigger-out, 0 = disabled)  (2 bytes)
+//   CMD_TRIG: 03 pin holdoff_hi holdoff_lo  (GPIO for trigger-out, 0 = disabled; debounce ms)  (4 bytes)
 const uint8_t CMD_DAC = 0x00;
 const uint8_t CMD_RST = 0x01;
 const uint8_t CMD_SPI = 0x02;
@@ -405,7 +419,7 @@ void loop() {
     if (have == 0) {
       if (b == CMD_DAC) need = 6;
       else if (b == CMD_RST) need = 2;
-      else if (b == CMD_TRIG) need = 2;
+      else if (b == CMD_TRIG) need = 4;
       else if (b == CMD_SPI) need = 0; // length comes from the count byte
       else continue; // not a command byte, drop it to resynchronize
     }
@@ -422,7 +436,7 @@ void loop() {
     if (need != 0 && have == need) {
       if (msg[0] == CMD_DAC) handleDacCommand(msg);
       else if (msg[0] == CMD_RST) pulseReset();
-      else if (msg[0] == CMD_TRIG) setTrigPin(msg[1]);
+      else if (msg[0] == CMD_TRIG) setTrigPin(msg[1], ((uint16_t)msg[2] << 8) | msg[3]);
       else handleSpiCommand(msg);
       have = 0;
       need = 0;

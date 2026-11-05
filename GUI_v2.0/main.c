@@ -865,6 +865,16 @@ static const char *const TRIG_PIN_NAMES[] = {"D13", "A0", "A1", "A2", "A3", "A4"
 static const uint8_t TRIG_PIN_GPIO[] = {13, 18, 17, 16, 15, 14, 8};
 #define NUM_TRIG_PINS 7
 
+// Debounce quiet period (ms) entry next to the pin dropdown, and the value last sent to the board
+static GtkWidget *trig_holdoff_entry = NULL;
+static unsigned long trig_holdoff_sent = 50;
+
+static unsigned long trig_holdoff_from_entry(void) {
+    if (!trig_holdoff_entry) return 50; // not built yet
+    unsigned long ms = strtoul(gtk_editable_get_text(GTK_EDITABLE(trig_holdoff_entry)), NULL, 10);
+    return ms > 65535 ? 65535 : ms;
+}
+
 static void send_trigger_pin(void) {
     if (!trig_dropdown) return; // the UI isn't built yet; activate() calls this again once it is
     ui_reset_trigger(); // the board restarts its count whenever it gets this command
@@ -872,9 +882,27 @@ static void send_trigger_pin(void) {
     guint sel = gtk_drop_down_get_selected(trig_dropdown);
     if (sel == GTK_INVALID_LIST_POSITION || sel > NUM_TRIG_PINS) return;
     uint8_t pin = sel == 0 ? 0 : TRIG_PIN_GPIO[sel - 1]; // 0 = disabled
-    uint8_t msg[2] = {TRIG_CMD_START, pin};
-    g_print("Trigger-out pin: %u\n", pin);
+    unsigned long ms = trig_holdoff_from_entry();
+    trig_holdoff_sent = ms;
+    uint8_t msg[4] = {TRIG_CMD_START, pin, (uint8_t)(ms >> 8), (uint8_t)(ms & 0xFF)};
+    g_print("Trigger-out pin: %u, debounce %lu ms\n", pin, ms);
     send_bytes(msg, sizeof(msg));
+}
+
+// Re-sends when the debounce value was edited (this also restarts the board's count)
+static void on_holdoff_edited(void) {
+    char text[16];
+    snprintf(text, sizeof(text), "%lu", trig_holdoff_from_entry());
+    gtk_editable_set_text(GTK_EDITABLE(trig_holdoff_entry), text); // normalize what was typed
+    if (trig_holdoff_from_entry() != trig_holdoff_sent) send_trigger_pin();
+}
+
+static void on_holdoff_activate(GtkEntry *entry, gpointer user_data) {
+    on_holdoff_edited();
+}
+
+static void on_holdoff_focus_leave(GtkEventController *controller, gpointer user_data) {
+    on_holdoff_edited();
 }
 
 static void on_trig_pin_changed(GObject *obj, GParamSpec *pspec, gpointer user_data) {
@@ -1373,6 +1401,25 @@ static void apply_theme(void) {
 }
 
 // Initialize GUI widgets inside activate
+// A row of controls that wraps onto extra lines when the window is narrow, so the row's width
+// never forces the window wider
+static GtkWidget *wrap_row(void) {
+    GtkWidget *row = gtk_flow_box_new();
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(row), GTK_SELECTION_NONE);
+    gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(row), 1);
+    gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(row), 32);
+    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(row), 10);
+    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(row), 6);
+    return row;
+}
+
+// Clicking the background takes keyboard focus away from whatever text box has it. Entries and
+// buttons claim their own clicks, so only clicks on empty space or labels reach this handler.
+// (Leaving an entry runs its focus-leave handler, so a typed voltage is snapped as usual.)
+static void on_background_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
+    gtk_window_set_focus(GTK_WINDOW(user_data), NULL);
+}
+
 static void activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *window;
 
@@ -1380,11 +1427,15 @@ static void activate(GtkApplication *app, gpointer user_data) {
     window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Reference Voltage Generator");
     g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), NULL);
+
+    GtkGesture *background_click = gtk_gesture_click_new();
+    g_signal_connect(background_click, "pressed", G_CALLBACK(on_background_pressed), window);
+    gtk_widget_add_controller(window, GTK_EVENT_CONTROLLER(background_click));
     gtk_window_set_resizable(GTK_WINDOW(window), TRUE);
 
     GtkWidget *scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
-                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_NEVER,
                                    GTK_POLICY_AUTOMATIC);
     // Open as wide as the widest row (the preset row), not a hardcoded width
     gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(scroll), TRUE);
@@ -1398,24 +1449,24 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), vbox);
 
     // Serial connection row (built first so conn_data exists for channels)
-    GtkWidget *conn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *conn_box = wrap_row();
     gtk_box_append(GTK_BOX(vbox), conn_box);
 
     GtkWidget *com_label = gtk_label_new("COM Port:");
     gtk_widget_set_halign(com_label, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(conn_box), com_label);
+    gtk_flow_box_append(GTK_FLOW_BOX(conn_box), com_label);
 
     // Filled in by refresh_ports() once the rest of the UI exists
     GtkWidget *com_dropdown = gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(NULL)), NULL);
-    gtk_box_append(GTK_BOX(conn_box), com_dropdown);
+    gtk_flow_box_append(GTK_FLOW_BOX(conn_box), com_dropdown);
 
     GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
-    gtk_box_append(GTK_BOX(conn_box), refresh_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(conn_box), refresh_btn);
 
     GtkWidget *baud_label = gtk_label_new("Baud Rate:");
     gtk_widget_set_halign(baud_label, GTK_ALIGN_CENTER);
     gtk_widget_set_margin_start(baud_label, 8);
-    gtk_box_append(GTK_BOX(conn_box), baud_label);
+    gtk_flow_box_append(GTK_FLOW_BOX(conn_box), baud_label);
 
     const char *baud_rates[] = {
         "1200", "2400", "4800", "9600",
@@ -1426,7 +1477,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     GtkStringList *baud_list = gtk_string_list_new(baud_rates);
     GtkWidget *baud_dropdown = gtk_drop_down_new(G_LIST_MODEL(baud_list), NULL);
     gtk_drop_down_set_selected(GTK_DROP_DOWN(baud_dropdown), 7); // 115200
-    gtk_box_append(GTK_BOX(conn_box), baud_dropdown);
+    gtk_flow_box_append(GTK_FLOW_BOX(conn_box), baud_dropdown);
 
     GtkWidget *connect_btn = gtk_button_new_with_label("Connect");
     GtkWidget *disconnect_btn = gtk_button_new_with_label("Disconnect");
@@ -1439,12 +1490,13 @@ static void activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(connect_btn, "clicked", G_CALLBACK(on_connect_clicked), conn_data);
     g_signal_connect(disconnect_btn, "clicked", G_CALLBACK(on_disconnect_clicked), NULL);
     g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_clicked), conn_data);
-    gtk_box_append(GTK_BOX(conn_box), connect_btn);
-    gtk_box_append(GTK_BOX(conn_box), disconnect_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(conn_box), connect_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(conn_box), disconnect_btn);
 
     // Connection status line, then populate the port list (auto-connects to a lone Feather)
     status_label = GTK_LABEL(gtk_label_new("Disconnected"));
     gtk_widget_set_halign(GTK_WIDGET(status_label), GTK_ALIGN_START);
+    gtk_label_set_wrap(status_label, TRUE);
     gtk_box_append(GTK_BOX(vbox), GTK_WIDGET(status_label));
     refresh_ports(conn_data);
 
@@ -1468,7 +1520,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
         // Editable channel name; saved with presets as "chN (name)"
         GtkWidget *name_entry = gtk_entry_new();
         g_object_set(name_entry, "placeholder-text", "name", NULL);
-        gtk_editable_set_width_chars(GTK_EDITABLE(name_entry), 12);
+        gtk_editable_set_width_chars(GTK_EDITABLE(name_entry), 6);
         gtk_entry_set_max_length(GTK_ENTRY(name_entry), 24);
         channel_names[i] = name_entry;
 
@@ -1481,6 +1533,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
         GtkWidget *entry = gtk_entry_new();
         apply_value(GTK_ENTRY(entry), 0.0);
         gtk_entry_set_input_purpose(GTK_ENTRY(entry), GTK_INPUT_PURPOSE_NUMBER);
+        gtk_editable_set_width_chars(GTK_EDITABLE(entry), 4); // stretches with the window (hexpand)
         gtk_widget_set_hexpand(entry, TRUE);
 
         g_signal_connect(entry, "activate", G_CALLBACK(on_entry_activate), NULL);
@@ -1523,7 +1576,17 @@ static void activate(GtkApplication *app, gpointer user_data) {
         update_buttons[i] = update_btn;
     }
 
-    gtk_window_set_default_size(GTK_WINDOW(window), -1, 950);
+    // Open at half the width of the (first) monitor; the scrolled window handles anything wider
+    int win_width = -1;
+    GListModel *monitors = gdk_display_get_monitors(gtk_widget_get_display(window));
+    GdkMonitor *monitor = g_list_model_get_n_items(monitors) > 0 ? g_list_model_get_item(monitors, 0) : NULL;
+    if (monitor) {
+        GdkRectangle geo;
+        gdk_monitor_get_geometry(monitor, &geo);
+        win_width = geo.width / 2;
+        g_object_unref(monitor);
+    }
+    gtk_window_set_default_size(GTK_WINDOW(window), win_width, 950);
     gtk_window_present(GTK_WINDOW(window));
 
     // power off all channels, power on all channels, update all channels
@@ -1547,12 +1610,12 @@ static void activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(all_update_btn, "clicked", G_CALLBACK(on_updateall_clicked), all_data);
 
     // Horizontal button bar
-    GtkWidget *all_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *all_box = wrap_row();
 	gtk_widget_set_hexpand(all_box, TRUE);
 	gtk_widget_set_halign(all_box, GTK_ALIGN_END);
-    gtk_box_append(GTK_BOX(all_box), all_off_btn);
-    gtk_box_append(GTK_BOX(all_box), all_on_btn);
-    gtk_box_append(GTK_BOX(all_box), all_update_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(all_box), all_off_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(all_box), all_on_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(all_box), all_update_btn);
     gtk_box_append(GTK_BOX(vbox), all_box);
 
     // Preset row: pick a saved preset to load or send, or save the current values
@@ -1561,6 +1624,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     preset_data->dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(NULL)), NULL));
     preset_data->name_entry = gtk_entry_new();
     g_object_set(preset_data->name_entry, "placeholder-text", "New preset name", NULL);
+    gtk_editable_set_width_chars(GTK_EDITABLE(preset_data->name_entry), 10);
     gtk_widget_set_hexpand(preset_data->name_entry, TRUE);
 
     char *preset_tip = g_strdup_printf("Preset file: %s", preset_file());
@@ -1576,13 +1640,13 @@ static void activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(preset_send_btn, "clicked", G_CALLBACK(on_preset_send_clicked), preset_data);
     g_signal_connect(preset_save_btn, "clicked", G_CALLBACK(on_preset_save_clicked), preset_data);
 
-    GtkWidget *preset_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(preset_box), gtk_label_new("Preset:"));
-    gtk_box_append(GTK_BOX(preset_box), GTK_WIDGET(preset_data->dropdown));
-    gtk_box_append(GTK_BOX(preset_box), preset_load_btn);
-    gtk_box_append(GTK_BOX(preset_box), preset_send_btn);
-    gtk_box_append(GTK_BOX(preset_box), preset_data->name_entry);
-    gtk_box_append(GTK_BOX(preset_box), preset_save_btn);
+    GtkWidget *preset_box = wrap_row();
+    gtk_flow_box_append(GTK_FLOW_BOX(preset_box), gtk_label_new("Preset:"));
+    gtk_flow_box_append(GTK_FLOW_BOX(preset_box), GTK_WIDGET(preset_data->dropdown));
+    gtk_flow_box_append(GTK_FLOW_BOX(preset_box), preset_load_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(preset_box), preset_send_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(preset_box), preset_data->name_entry);
+    gtk_flow_box_append(GTK_FLOW_BOX(preset_box), preset_save_btn);
     gtk_box_append(GTK_BOX(vbox), preset_box);
     presets_reload(preset_data, NULL);
 	
@@ -1597,6 +1661,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(vbox), ls_title);
 
     GtkWidget *ls_note = gtk_label_new("Channels 9-11 power the SPI level-shifter chips. Changing these changes the chip's signal levels.");
+    gtk_label_set_wrap(GTK_LABEL(ls_note), TRUE);
     gtk_box_append(GTK_BOX(vbox), ls_note);
 
     const char *ls_names[3] = {
@@ -1616,6 +1681,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
         GtkWidget *entry = gtk_entry_new();
         apply_value(GTK_ENTRY(entry), LS_DEFAULTS[i]);
         gtk_entry_set_input_purpose(GTK_ENTRY(entry), GTK_INPUT_PURPOSE_NUMBER);
+        gtk_editable_set_width_chars(GTK_EDITABLE(entry), 4); // stretches with the window (hexpand)
         gtk_widget_set_hexpand(entry, TRUE);
         g_signal_connect(entry, "activate", G_CALLBACK(on_entry_activate), NULL);
         GtkEventController *focus = gtk_event_controller_focus_new();
@@ -1670,16 +1736,16 @@ static void activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_reset_clicked), NULL);
 
     // SPI settings bar
-    GtkWidget *spi_settings = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    GtkWidget *spi_settings = wrap_row();
     gtk_widget_set_hexpand(spi_settings, TRUE);
     gtk_widget_set_halign(spi_settings, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(spi_settings), speed_label);
-    gtk_box_append(GTK_BOX(spi_settings), speed_dropdown);
-    gtk_box_append(GTK_BOX(spi_settings), bit_label);
-    gtk_box_append(GTK_BOX(spi_settings), bit_dropdown);
-    gtk_box_append(GTK_BOX(spi_settings), mode_label);
-    gtk_box_append(GTK_BOX(spi_settings), mode_dropdown);
-    gtk_box_append(GTK_BOX(spi_settings), reset_btn);
+    gtk_flow_box_append(GTK_FLOW_BOX(spi_settings), speed_label);
+    gtk_flow_box_append(GTK_FLOW_BOX(spi_settings), speed_dropdown);
+    gtk_flow_box_append(GTK_FLOW_BOX(spi_settings), bit_label);
+    gtk_flow_box_append(GTK_FLOW_BOX(spi_settings), bit_dropdown);
+    gtk_flow_box_append(GTK_FLOW_BOX(spi_settings), mode_label);
+    gtk_flow_box_append(GTK_FLOW_BOX(spi_settings), mode_dropdown);
+    gtk_flow_box_append(GTK_FLOW_BOX(spi_settings), reset_btn);
     gtk_box_append(GTK_BOX(vbox), spi_settings);
 	
 	// SPI byte grid
@@ -1712,6 +1778,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
 		
 		// limit entry to 2 characters
 		gtk_entry_set_max_length(GTK_ENTRY(byte_entry), 2);
+		gtk_editable_set_width_chars(GTK_EDITABLE(byte_entry), 2);
 		
 		// widget width and grid placement	
 		gtk_widget_set_hexpand(byte_entry, TRUE);
@@ -1727,7 +1794,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
 	gtk_box_append(GTK_BOX(vbox), send_label);
 	
 	// Checkbuttons acquire the behavior of radio buttons when grouped	
-	GtkWidget *byte_radio_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *byte_radio_box = wrap_row();
 	gtk_box_append(GTK_BOX(vbox), byte_radio_box);
 	
 	GtkWidget *byte_radio_btn0 = gtk_check_button_new_with_label("Byte 0");
@@ -1737,9 +1804,9 @@ static void activate(GtkApplication *app, gpointer user_data) {
 	gtk_check_button_set_group(GTK_CHECK_BUTTON(byte_radio_btn1), GTK_CHECK_BUTTON(byte_radio_btn0));
 	gtk_check_button_set_group(GTK_CHECK_BUTTON(byte_radio_btn2), GTK_CHECK_BUTTON(byte_radio_btn0));
 	
-	gtk_box_append(GTK_BOX(byte_radio_box), byte_radio_btn0);
-	gtk_box_append(GTK_BOX(byte_radio_box), byte_radio_btn1);
-	gtk_box_append(GTK_BOX(byte_radio_box), byte_radio_btn2);
+	gtk_flow_box_append(GTK_FLOW_BOX(byte_radio_box), byte_radio_btn0);
+	gtk_flow_box_append(GTK_FLOW_BOX(byte_radio_box), byte_radio_btn1);
+	gtk_flow_box_append(GTK_FLOW_BOX(byte_radio_box), byte_radio_btn2);
 	gtk_widget_set_halign(byte_radio_box, GTK_ALIGN_CENTER);
 	
 	// Add btn data to struct	
@@ -1761,7 +1828,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
 
 	// 'Send' button will send byte via SPI
 	GtkWidget *send_btn = gtk_button_new_with_label("SEND");
-	gtk_box_append(GTK_BOX(byte_radio_box), send_btn);
+	gtk_flow_box_append(GTK_FLOW_BOX(byte_radio_box), send_btn);
 
     // 'Send' callback
 	g_signal_connect(send_btn, "clicked", G_CALLBACK(on_send_clicked), radio_btn_data);
@@ -1862,17 +1929,37 @@ static void activate(GtkApplication *app, gpointer user_data) {
     global_rx_widgets->trig_indicator = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(global_rx_widgets->trig_indicator), "<span foreground=\"gray\">&#9679;</span>");
 
-    GtkWidget *trig_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    trig_holdoff_entry = gtk_entry_new();
+    gtk_editable_set_text(GTK_EDITABLE(trig_holdoff_entry), "50");
+    gtk_editable_set_width_chars(GTK_EDITABLE(trig_holdoff_entry), 5);
+    gtk_entry_set_max_length(GTK_ENTRY(trig_holdoff_entry), 5);
+    gtk_entry_set_input_purpose(GTK_ENTRY(trig_holdoff_entry), GTK_INPUT_PURPOSE_DIGITS);
+    gtk_widget_set_tooltip_text(trig_holdoff_entry,
+        "A rising edge only counts if no edge was seen in the previous N ms, so contact bounce counts once. "
+        "0 counts every edge. Triggers closer together than this are merged.");
+    g_signal_connect(trig_holdoff_entry, "activate", G_CALLBACK(on_holdoff_activate), NULL);
+    GtkEventController *holdoff_focus = gtk_event_controller_focus_new();
+    g_signal_connect(holdoff_focus, "leave", G_CALLBACK(on_holdoff_focus_leave), NULL);
+    gtk_widget_add_controller(trig_holdoff_entry, holdoff_focus);
+
+    // Two rows (settings, then readout) so the section stays narrow
+    GtkWidget *trig_box = wrap_row();
     gtk_widget_set_halign(trig_box, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(trig_box), gtk_label_new("Pin"));
-    gtk_box_append(GTK_BOX(trig_box), GTK_WIDGET(trig_dropdown));
-    gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_indicator);
-    gtk_box_append(GTK_BOX(trig_box), gtk_label_new("Count:"));
-    gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_count_label);
-    gtk_box_append(GTK_BOX(trig_box), gtk_label_new("Last:"));
-    gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_time_label);
-    gtk_box_append(GTK_BOX(trig_box), global_rx_widgets->trig_ago_label);
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_box), gtk_label_new("Pin"));
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_box), GTK_WIDGET(trig_dropdown));
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_box), gtk_label_new("Debounce (ms)"));
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_box), trig_holdoff_entry);
     gtk_box_append(GTK_BOX(vbox), trig_box);
+
+    GtkWidget *trig_readout_box = wrap_row();
+    gtk_widget_set_halign(trig_readout_box, GTK_ALIGN_CENTER);
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_readout_box), global_rx_widgets->trig_indicator);
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_readout_box), gtk_label_new("Count:"));
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_readout_box), global_rx_widgets->trig_count_label);
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_readout_box), gtk_label_new("Last:"));
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_readout_box), global_rx_widgets->trig_time_label);
+    gtk_flow_box_append(GTK_FLOW_BOX(trig_readout_box), global_rx_widgets->trig_ago_label);
+    gtk_box_append(GTK_BOX(vbox), trig_readout_box);
 
     // The launch-time auto-connect ran before this dropdown existed, so tell the board now
     // (otherwise it keeps whatever pin was selected in the last session)
