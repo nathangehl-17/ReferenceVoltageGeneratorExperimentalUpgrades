@@ -8,6 +8,8 @@
 - [How to Upload Sketch to Adafruit Feather](#how-to-upload-sketch-to-adafruit-feather)
 - [How to Upload Sketch to Arduino Nano](#how-to-upload-sketch-to-arduino-nano)
 - [How to Wire Feather to Nano](#how-to-wire-feather-to-nano)
+- [Setting Up GUI v2.0 on a New Computer](#setting-up-gui-v20-on-a-new-computer)
+- [GUI v2.0: Level Shifters, Trigger Out and POCI Read-back](#gui-v20-level-shifters-trigger-out-and-poci-read-back)
 - [Known Issues](#known-issues)
 
 Reference Voltage Generator is a set of programs in which a user can enter voltage values to a graphical user interface (GUI) and a microcontroller responds to GUI events by sending those voltage values to digital-to-analog converters (DACs). The GUI application in Figure 1 was developed on Linux in C using GTK4. It can be cross-compiled to Windows using Linux as the host machine. The precompiled Windows executable is also available. The GUI was designed to communicate with an Adafruit Feather ESP32-S3 Reverse TFT. The Feather application parses commands received from the GUI and determines if the command intends to send a voltage value to one of the DACs via I2C, or if the command is meant to send bytes to another microcontroller via SPI.
@@ -170,6 +172,92 @@ Each row in the table indicates which pins to connect together. SCK on the Feath
 
 ![Arduino Nano pinout](images/figure7.png)
 *Figure 6. Arduino Nano pinout.*
+
+## Setting Up GUI v2.0 on a New Computer
+[Jump to Top](#reference-voltage-generator)
+
+This walks through getting the GUI v2.0 code onto a new computer, building it, putting the matching firmware on the Feather, and connecting the two. The steps below were tested on macOS. The Linux and Windows steps use each system's standard GTK4 packages but have not been tested for v2.0.
+
+You need:
+- A computer running macOS, Linux or Windows.
+- An Adafruit Feather ESP32-S3 Reverse TFT.
+- A USB cable that carries data (a charge-only cable will not work).
+
+### 1. Get the code
+Install [Git](https://git-scm.com/downloads) if it is not already installed, then clone the repository. GUI v2.0 and its firmware live in the `GUI_v2.0` folder.
+```
+git clone https://github.com/nathangehl-17/ReferenceVoltageGeneratorExperimentalUpgrades.git
+cd ReferenceVoltageGeneratorExperimentalUpgrades/GUI_v2.0
+```
+
+### 2. Install the build tools
+The GUI is a single C file that needs a C compiler, `pkg-config` and the GTK4 development files.
+
+**macOS**
+```
+xcode-select --install          # C compiler (skip if already installed)
+brew install gtk4 pkg-config    # needs Homebrew: https://brew.sh
+```
+
+**Linux (Debian/Ubuntu)**
+```
+sudo apt install build-essential pkg-config libgtk-4-dev git
+sudo usermod -aG dialout $USER  # lets you open the Feather's serial port; log out and back in afterwards
+```
+On Fedora use `sudo dnf install gcc pkgconf-pkg-config gtk4-devel git`.
+
+**Windows**
+There is no prebuilt v2.0 executable. Either build with [MSYS2](https://www.msys2.org), or cross-compile from Linux as described in [How to Cross-Compile on Linux](#how-to-cross-compile-on-linux). For MSYS2, open the *MSYS2 UCRT64* shell and run:
+```
+pacman -S mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf git
+```
+
+### 3. Build and run the GUI
+From the `GUI_v2.0` folder:
+```
+gcc $(pkg-config --cflags gtk4) -o main main.c $(pkg-config --libs gtk4) -lm
+./main
+```
+On Windows (MSYS2) the output is an `.exe`:
+```
+gcc main.c -o ReferenceVoltageGenerator.exe $(pkg-config --cflags --libs gtk4) -lm
+./ReferenceVoltageGenerator.exe
+```
+Always build on the new computer. The `main` file that comes with the repository is a Linux program and will not run on macOS or Windows.
+
+A harmless message such as `Gdk-CRITICAL ... gdk_surface_thaw_updates` may print in the terminal when you open a dropdown. It comes from GTK and does not affect the program.
+
+Presets are read from `presets.ini` in the folder you launch the GUI from, or from the file named by the `RVG_PRESETS` environment variable. If neither exists, the GUI uses `rvg/presets.ini` in your user config folder.
+
+### 4. Put the firmware on the Feather
+The GUI and the firmware must be from the same version. Use the firmware in `GUI_v2.0/esp32_voltage_generator`, and do not mix it with the v1.0 GUI.
+
+Install the Arduino command-line tool ([other install options](https://arduino.github.io/arduino-cli/latest/installation/)), the ESP32 board package and the display libraries:
+```
+brew install arduino-cli        # macOS; on Linux/Windows use the install page above
+arduino-cli core update-index
+arduino-cli core install esp32:esp32
+arduino-cli lib install "Adafruit GFX Library" "Adafruit ST7735 and ST7789 Library" "Adafruit BusIO"
+```
+Plug in the Feather and find its port, then compile and upload from the `GUI_v2.0` folder:
+```
+arduino-cli board list          # note the port, e.g. /dev/cu.usbmodem101, /dev/ttyACM0 or COM5
+cd esp32_voltage_generator
+arduino-cli compile --fqbn esp32:esp32:adafruit_feather_esp32s3_reversetft .
+arduino-cli upload -p YOUR_PORT --fqbn esp32:esp32:adafruit_feather_esp32s3_reversetft .
+```
+Replace `YOUR_PORT` with the port from `board list`. The Arduino IDE also works: install the *esp32* boards package, pick *Adafruit Feather ESP32-S3 Reverse TFT*, install the same three libraries, then Verify and Upload. If the upload cannot find the board, hold the D0 button, press Reset, release D0, and try again. The older `esptool` method in [How to Upload Sketch to Adafruit Feather](#how-to-upload-sketch-to-adafruit-feather) also still works.
+
+When the firmware starts, the Feather's screen shows "Ready to receive." and it sets the level-shifter rails (see the next section).
+
+### 5. Connect
+Start the GUI with the Feather plugged in. It lists the serial ports it finds, puts the Feather first and connects automatically if it is the only one. If it does not connect, press **Refresh**, choose the port and press **Connect**. Make sure nothing else, such as the Arduino serial monitor, has the port open.
+
+If something goes wrong:
+- **`gtk4` or `gtk/gtk.h` not found:** the GTK4 development package from step 2 is missing, or `pkg-config` cannot see it. Re-run step 2 and open a new terminal.
+- **Permission denied on the port (Linux):** add yourself to the `dialout` group as in step 2 and log out and back in.
+- **Port is busy:** close the Arduino serial monitor or any other program using the port.
+- **No port listed:** try a different USB cable. Charge-only cables do not carry data.
 
 ## GUI v2.0: Level Shifters, Trigger Out and POCI Read-back
 [Jump to Top](#reference-voltage-generator)
