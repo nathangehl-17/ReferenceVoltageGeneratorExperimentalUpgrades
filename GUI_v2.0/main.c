@@ -45,7 +45,7 @@ const uint8_t DAC_ADDR[4] = {0x48, 0x49, 0x4A, 0x4B};
 // Microcontroller will use this starting byte to determine how to read the subsequent bytes
 // GUI tells the microcontroller what to do. Microcontroller does the actual I2C/SPI.
 const uint8_t DAC_CMD_START = 0x00; // writing voltage value to a DAC
-const uint8_t RST_CMD_START = 0x01; // pulling down Reset pin
+const uint8_t RST_CMD_START = 0x01; // pulsing the RESET pin (GPIO 11) high for N ms
 const uint8_t SPI_CMD_START = 0x02; // writing SPI command
 const uint8_t TRIG_CMD_START = 0x03; // choosing the GPIO that watches trigger-out (0 = disabled)
 const uint8_t CH9_RST_CMD_START = 0x04; // hold channel 9 (SPI reset, active low) at 0 V for N ms
@@ -725,22 +725,32 @@ static void on_off_clicked(GtkToggleButton *button, gpointer user_data) {
     send_voltage_command(REG_CONFIG, CH, v);
 }
 
-// Assuming microcontroller RST pin is active LOW, pull it down.
-static void on_reset_clicked(GtkButton *button) {
-    uint8_t msg[2] = {RST_CMD_START, 0x00};
-    g_print("Pulling down RST pin.\n"); // "%02X %02X\n", msg[0], msg[1]
-    send_bytes(msg, sizeof(msg));
+// Parses a pulse width box: a whole number of ms, 1 to 60000. Sets a status message on bad input.
+static gboolean parse_pulse_ms(GtkEditable *entry, long *ms) {
+    const char *text = gtk_editable_get_text(entry);
+    char *end = NULL;
+    *ms = strtol(text, &end, 10);
+    if (end == text || *end != '\0' || *ms < 1 || *ms > 60000) {
+        set_status("Pulse width must be a whole number of ms, 1 to 60000.");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// Pulses the Feather's RESET pin (GPIO 11): idles low, goes high for the entered ms, then low again.
+static void on_reset_clicked(GtkWidget *widget, gpointer user_data) {
+    long ms;
+    if (!parse_pulse_ms(GTK_EDITABLE(user_data), &ms)) return;
+    if (!require_connection()) return;
+    uint8_t msg[3] = {RST_CMD_START, (uint8_t)(ms >> 8), (uint8_t)(ms & 0xFF)};
+    g_print("Pulling RST pin high for %ld ms.\n", ms);
+    if (send_bytes(msg, sizeof(msg))) set_status("RESET pulsed high for %ld ms", ms);
 }
 
 // Holds channel 9 (SPI reset, active low) at 0 V for the entered milliseconds; the board times it.
 static void on_ch9_reset_clicked(GtkWidget *widget, gpointer user_data) {
-    GtkEditable *entry = GTK_EDITABLE(user_data);
-    char *end = NULL;
-    long ms = strtol(gtk_editable_get_text(entry), &end, 10);
-    if (end == gtk_editable_get_text(entry) || *end != '\0' || ms < 1 || ms > 60000) {
-        set_status("Reset low time must be a whole number of ms, 1 to 60000.");
-        return;
-    }
+    long ms;
+    if (!parse_pulse_ms(GTK_EDITABLE(user_data), &ms)) return;
     if (!require_connection()) return;
     uint8_t msg[3] = {CH9_RST_CMD_START, (uint8_t)(ms >> 8), (uint8_t)(ms & 0xFF)};
     g_print("Channel 9 reset: low for %ld ms\n", ms);
@@ -1886,8 +1896,15 @@ static void activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *mode_dropdown = gtk_drop_down_new(G_LIST_MODEL(mode_list), NULL);
 
     // Write to Reset pin (any GPIO on a microcontroller)
-    GtkWidget *reset_btn = gtk_button_new_with_label("RESET");
-    g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_reset_clicked), NULL);
+    GtkWidget *reset_btn = gtk_button_new_with_label("PULSE RESET HIGH (GPIO 11)");
+    GtkWidget *reset_entry = gtk_entry_new();
+    gtk_editable_set_text(GTK_EDITABLE(reset_entry), "1");
+    gtk_entry_set_input_purpose(GTK_ENTRY(reset_entry), GTK_INPUT_PURPOSE_DIGITS);
+    gtk_editable_set_width_chars(GTK_EDITABLE(reset_entry), 6);
+    gtk_widget_set_tooltip_text(reset_entry, "How long the RESET pin (GPIO 11) stays high (1-60000 ms)");
+    gtk_widget_set_tooltip_text(reset_btn, "Pulse GPIO 11 high for the time shown, then low");
+    g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_reset_clicked), reset_entry);
+    g_signal_connect(reset_entry, "activate", G_CALLBACK(on_reset_clicked), reset_entry);
 
     // SPI settings bar
     GtkWidget *spi_settings = wrap_row();
@@ -1897,8 +1914,14 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(spi_settings), bit_dropdown);
     gtk_box_append(GTK_BOX(spi_settings), mode_label);
     gtk_box_append(GTK_BOX(spi_settings), mode_dropdown);
-    gtk_box_append(GTK_BOX(spi_settings), reset_btn);
     gtk_box_append(GTK_BOX(vbox), spi_settings);
+
+    // GPIO 11 reset: idles low, goes high for the entered time
+    GtkWidget *reset_box = wrap_row();
+    gtk_box_append(GTK_BOX(reset_box), gtk_label_new("Reset high (GPIO 11) (ms):"));
+    gtk_box_append(GTK_BOX(reset_box), reset_entry);
+    gtk_box_append(GTK_BOX(reset_box), reset_btn);
+    gtk_box_append(GTK_BOX(vbox), reset_box);
 
     // Channel 9 reset: idles at 2.5 V, goes to 0 V for the entered time
     GtkWidget *ch9_entry = gtk_entry_new();
@@ -1906,12 +1929,12 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_entry_set_input_purpose(GTK_ENTRY(ch9_entry), GTK_INPUT_PURPOSE_DIGITS);
     gtk_editable_set_width_chars(GTK_EDITABLE(ch9_entry), 6);
     gtk_widget_set_tooltip_text(ch9_entry, "How long channel 9 stays at 0 V (1-60000 ms)");
-    GtkWidget *ch9_btn = gtk_button_new_with_label("PULSE RESET (ch 9)");
+    GtkWidget *ch9_btn = gtk_button_new_with_label("PULSE RESET LOW (ch 9)");
     gtk_widget_set_tooltip_text(ch9_btn, "Channel 9 idles at 2.5 V; this drops it to 0 V for the time shown, then back");
     g_signal_connect(ch9_btn, "clicked", G_CALLBACK(on_ch9_reset_clicked), ch9_entry);
     g_signal_connect(ch9_entry, "activate", G_CALLBACK(on_ch9_reset_clicked), ch9_entry);
     GtkWidget *ch9_box = wrap_row();
-    gtk_box_append(GTK_BOX(ch9_box), gtk_label_new("Ch 9 reset low (ms):"));
+    gtk_box_append(GTK_BOX(ch9_box), gtk_label_new("Reset low (ch 9) (ms):"));
     gtk_box_append(GTK_BOX(ch9_box), ch9_entry);
     gtk_box_append(GTK_BOX(ch9_box), ch9_btn);
     gtk_box_append(GTK_BOX(vbox), ch9_box);

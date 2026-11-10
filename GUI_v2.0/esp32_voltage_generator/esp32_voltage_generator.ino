@@ -334,10 +334,12 @@ void spiTransfer(const uint8_t *data, uint8_t count) {
   SPI.endTransaction();
 }
 
-// Pulses the chip RESET pin
-void pulseReset() {
+// Pulses the chip RESET pin for `ms` (1 to 60000)
+void pulseReset(uint16_t ms) {
+  if (ms < 1) ms = 1;
+  if (ms > 60000) ms = 60000;
   digitalWrite(RST_PIN, RST_ACTIVE_LEVEL);
-  delay(1);
+  delay(ms);
   digitalWrite(RST_PIN, !RST_ACTIVE_LEVEL);
 }
 
@@ -357,7 +359,7 @@ void pulseCh9Reset(uint16_t ms) {
 // =============================================================================
 // Every GUI command starts with a command byte:
 //   CMD_DAC: 00 bank dac_addr reg value_hi value_lo   (6 bytes)
-//   CMD_RST: 01 00                                    (2 bytes)
+//   CMD_RST: 01 ms_hi ms_lo  (hold RST_PIN active for ms)  (3 bytes)
 //   CMD_SPI: 02 count byte0 .. byte(count-1)          (2 + count bytes)
 //   CMD_TRIG: 03 pin holdoff_hi holdoff_lo  (GPIO for trigger-out, 0 = disabled; debounce ms)  (4 bytes)
 //   CMD_CH9_RST: 04 ms_hi ms_lo  (hold channel 9 low for ms, then back to 2.5 V)  (3 bytes)
@@ -439,7 +441,7 @@ void loop() {
 
     if (have == 0) {
       if (b == CMD_DAC) need = 6;
-      else if (b == CMD_RST) need = 2;
+      else if (b == CMD_RST) need = 3;
       else if (b == CMD_TRIG) need = 4;
       else if (b == CMD_CH9_RST) need = 3;
       else if (b == CMD_SPI) need = 0; // length comes from the count byte
@@ -457,7 +459,7 @@ void loop() {
 
     if (need != 0 && have == need) {
       if (msg[0] == CMD_DAC) handleDacCommand(msg);
-      else if (msg[0] == CMD_RST) pulseReset();
+      else if (msg[0] == CMD_RST) pulseReset(((uint16_t)msg[1] << 8) | msg[2]);
       else if (msg[0] == CMD_CH9_RST) pulseCh9Reset(((uint16_t)msg[1] << 8) | msg[2]);
       else if (msg[0] == CMD_TRIG) setTrigPin(msg[1], ((uint16_t)msg[2] << 8) | msg[3]);
       else handleSpiCommand(msg);
