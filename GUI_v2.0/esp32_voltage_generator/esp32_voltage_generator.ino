@@ -175,11 +175,12 @@ float codeToVoltage(uint16_t code) {
 }
 
 // =============================================================================
-//  Level-shifter rails (two SN74LVC245A, one fixed each way), driven by DAC ch 9-11
+//  Level-shifter rails (two SN74LVC245A, one fixed each way), driven by DAC channels 10-12
+//  (board labels; the code below uses 0-based indexes, so these are indexes 9-11)
 // =============================================================================
-// ch 11 = 0 V: GND of both chips, DIR of the RX chip (low = B->A), both OE pins (low = enabled)
-// ch 10 = 2.5 V: VCC of the TX chip (Feather -> chip), also its DIR (high = A->B)
-// ch 9  = 3.3 V: VCC of the RX chip (chip -> Feather)
+// channel 12 (index 11) = 0 V: GND of both chips, DIR of the RX chip (low = B->A), both OE pins (low = enabled)
+// channel 11 (index 10) = 2.5 V: VCC of the TX chip (Feather -> chip), also its DIR (high = A->B)
+// channel 10 (index 9)  = 3.3 V: VCC of the RX chip (chip -> Feather)
 const uint16_t LS_GND_CODE = 0;
 const uint16_t LS_TX_VCC_CODE = 0x8000; // 2.5 V
 const uint16_t LS_RX_VCC_CODE = 43254;  // 3.3 V
@@ -355,7 +356,7 @@ void showDacUpdate(uint8_t channel, uint8_t reg, uint16_t code) {
   tft.setCursor(0, 20);
   tft.print("DAC: ");
   tft.setTextColor(ST77XX_WHITE);
-  tft.print(channel);
+  tft.print(channel + 1); // the board labels channels 1-12
 
   if (reg == REG_CONFIG) {
     if (code & 0x0001) {
