@@ -175,16 +175,24 @@ float codeToVoltage(uint16_t code) {
 }
 
 // =============================================================================
-//  Level-shifter rails (two SN74LVC245A, one fixed each way), driven by DAC ch 9-11
+//  Level-shifter rails (two SN74LVC245A, one fixed each way), driven by DAC channels 10-12
+//  (board labels; the code below uses 0-based indexes, so these are indexes 9-11)
 // =============================================================================
-// ch 11 = 0 V: GND of both chips, DIR of the RX chip (low = B->A), both OE pins (low = enabled)
-// ch 10 = 2.5 V: VCC of the TX chip (Feather -> chip), also its DIR (high = A->B)
-// ch 9  = 3.3 V: VCC of the RX chip (chip -> Feather)
+// channel 12 (index 11) = 0 V: GND of both chips, DIR of the RX chip (low = B->A), both OE pins (low = enabled)
+// channel 11 (index 10) = 2.5 V: VCC of the TX chip (Feather -> chip), also its DIR (high = A->B)
+// channel 10 (index 9)  = 3.3 V: VCC of the RX chip (chip -> Feather)
 const uint16_t LS_GND_CODE = 0;
 const uint16_t LS_TX_VCC_CODE = 0x8000; // 2.5 V
 const uint16_t LS_RX_VCC_CODE = 43254;  // 3.3 V
 
+// channel 9 (index 8) = SPI target reset, active low: idles at 2.5 V, pulsed to 0 V by CMD_CH9_RST
+const uint16_t CH9_IDLE_CODE = 0x8000; // 2.5 V
+const uint8_t CH9_BANK = 2;
+const uint8_t CH9_CHIP = 0;
+const uint16_t CH9_RST_MAX_MS = 60000;
+
 void levelShifterInit() {
+  dacWriteReg(CH9_BANK, CH9_CHIP, REG_DAC, CH9_IDLE_CODE);
   dacWriteReg(2, 3, REG_DAC, LS_GND_CODE);
   dacWriteReg(2, 2, REG_DAC, LS_TX_VCC_CODE);
   dacWriteReg(2, 1, REG_DAC, LS_RX_VCC_CODE);
@@ -333,6 +341,17 @@ void pulseReset() {
   digitalWrite(RST_PIN, !RST_ACTIVE_LEVEL);
 }
 
+// Drives channel 9 (SPI target reset, active low) to 0 V for `ms`, then back to 2.5 V
+void pulseCh9Reset(uint16_t ms) {
+  if (ms < 1) ms = 1;
+  if (ms > CH9_RST_MAX_MS) ms = CH9_RST_MAX_MS;
+  dacWriteReg(CH9_BANK, CH9_CHIP, REG_DAC, 0);
+  showDacUpdate(CH9_BANK * DACS_PER_BANK + CH9_CHIP, REG_DAC, 0);
+  delay(ms);
+  dacWriteReg(CH9_BANK, CH9_CHIP, REG_DAC, CH9_IDLE_CODE);
+  showDacUpdate(CH9_BANK * DACS_PER_BANK + CH9_CHIP, REG_DAC, CH9_IDLE_CODE);
+}
+
 // =============================================================================
 //  Command handling
 // =============================================================================
@@ -341,10 +360,12 @@ void pulseReset() {
 //   CMD_RST: 01 00                                    (2 bytes)
 //   CMD_SPI: 02 count byte0 .. byte(count-1)          (2 + count bytes)
 //   CMD_TRIG: 03 pin holdoff_hi holdoff_lo  (GPIO for trigger-out, 0 = disabled; debounce ms)  (4 bytes)
+//   CMD_CH9_RST: 04 ms_hi ms_lo  (hold channel 9 low for ms, then back to 2.5 V)  (3 bytes)
 const uint8_t CMD_DAC = 0x00;
 const uint8_t CMD_RST = 0x01;
 const uint8_t CMD_SPI = 0x02;
 const uint8_t CMD_TRIG = 0x03;
+const uint8_t CMD_CH9_RST = 0x04;
 
 void showDacUpdate(uint8_t channel, uint8_t reg, uint16_t code) {
   tft.fillScreen(ST77XX_BLACK);
@@ -355,7 +376,7 @@ void showDacUpdate(uint8_t channel, uint8_t reg, uint16_t code) {
   tft.setCursor(0, 20);
   tft.print("DAC: ");
   tft.setTextColor(ST77XX_WHITE);
-  tft.print(channel);
+  tft.print(channel + 1); // the board labels channels 1-12
 
   if (reg == REG_CONFIG) {
     if (code & 0x0001) {
@@ -420,6 +441,7 @@ void loop() {
       if (b == CMD_DAC) need = 6;
       else if (b == CMD_RST) need = 2;
       else if (b == CMD_TRIG) need = 4;
+      else if (b == CMD_CH9_RST) need = 3;
       else if (b == CMD_SPI) need = 0; // length comes from the count byte
       else continue; // not a command byte, drop it to resynchronize
     }
@@ -436,6 +458,7 @@ void loop() {
     if (need != 0 && have == need) {
       if (msg[0] == CMD_DAC) handleDacCommand(msg);
       else if (msg[0] == CMD_RST) pulseReset();
+      else if (msg[0] == CMD_CH9_RST) pulseCh9Reset(((uint16_t)msg[1] << 8) | msg[2]);
       else if (msg[0] == CMD_TRIG) setTrigPin(msg[1], ((uint16_t)msg[2] << 8) | msg[3]);
       else handleSpiCommand(msg);
       have = 0;

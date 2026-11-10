@@ -15,7 +15,7 @@
   <text x="326" y="666" font-size="16" text-anchor="end" fill="#111">MISO  GPIO37</text>
   <text x="326" y="746" font-size="16" text-anchor="end" fill="#111">Trigger in  D13 or A0-A5</text>
   <text x="326" y="766" font-size="13" text-anchor="end" fill="#555">(chosen in the GUI)</text>
-  <text x="60" y="820" font-size="13" fill="#333">DAC ch 9-11 (bank 2, I2C on GPIO 9/10)</text>
+  <text x="60" y="820" font-size="13" fill="#333">DAC ch 10-12 (bank 2, I2C on GPIO 9/10)</text>
   <text x="60" y="838" font-size="13" fill="#333">supply every rail shown in color.</text>
 
   <!-- TX 245 -->
@@ -73,10 +73,10 @@
     <line x1="790" y1="390" x2="790" y2="435" stroke="#7f8c8d"/>
   </g>
   <g font-size="14" font-weight="bold" text-anchor="middle">
-    <text x="650" y="60" fill="#e67e22">VCC</text><text x="650" y="76" fill="#e67e22">ch 10 (2.5 V)</text>
-    <text x="790" y="60" fill="#e67e22">DIR</text><text x="790" y="76" fill="#e67e22">ch 10 (high, A to B)</text>
-    <text x="650" y="463" fill="#7f8c8d">GND</text><text x="650" y="479" fill="#7f8c8d">ch 11 (0 V)</text>
-    <text x="790" y="463" fill="#7f8c8d">OE</text><text x="790" y="479" fill="#7f8c8d">ch 11 (low, enabled)</text>
+    <text x="650" y="60" fill="#e67e22">VCC</text><text x="650" y="76" fill="#e67e22">ch 11 (2.5 V)</text>
+    <text x="790" y="60" fill="#e67e22">DIR</text><text x="790" y="76" fill="#e67e22">ch 11 (high, A to B)</text>
+    <text x="650" y="463" fill="#7f8c8d">GND</text><text x="650" y="479" fill="#7f8c8d">ch 12 (0 V)</text>
+    <text x="790" y="463" fill="#7f8c8d">OE</text><text x="790" y="479" fill="#7f8c8d">ch 12 (low, enabled)</text>
   </g>
 
   <!-- RX power / control stubs -->
@@ -87,16 +87,16 @@
     <line x1="790" y1="850" x2="790" y2="895" stroke="#7f8c8d"/>
   </g>
   <g font-size="14" font-weight="bold" text-anchor="middle">
-    <text x="650" y="520" fill="#8e44ad">VCC</text><text x="650" y="536" fill="#8e44ad">ch 9 (3.3 V)</text>
-    <text x="790" y="520" fill="#7f8c8d">DIR</text><text x="790" y="536" fill="#7f8c8d">ch 11 (low, B to A)</text>
-    <text x="650" y="923" fill="#7f8c8d">GND</text><text x="650" y="939" fill="#7f8c8d">ch 11 (0 V)</text>
-    <text x="790" y="923" fill="#7f8c8d">OE</text><text x="790" y="939" fill="#7f8c8d">ch 11 (low, enabled)</text>
+    <text x="650" y="520" fill="#8e44ad">VCC</text><text x="650" y="536" fill="#8e44ad">ch 10 (3.3 V)</text>
+    <text x="790" y="520" fill="#7f8c8d">DIR</text><text x="790" y="536" fill="#7f8c8d">ch 12 (low, B to A)</text>
+    <text x="650" y="923" fill="#7f8c8d">GND</text><text x="650" y="939" fill="#7f8c8d">ch 12 (0 V)</text>
+    <text x="790" y="923" fill="#7f8c8d">OE</text><text x="790" y="939" fill="#7f8c8d">ch 12 (low, enabled)</text>
   </g>
 
   <!-- Legend -->
   <g font-size="14" fill="#111">
-    <rect x="40" y="890" width="16" height="16" fill="#7f8c8d"/><text x="64" y="903">ch 11: 0 V (GND, RX DIR, both OE)</text>
-    <rect x="40" y="912" width="16" height="16" fill="#e67e22"/><text x="64" y="925">ch 10: 2.5 V (TX VCC and DIR)</text>
-    <rect x="300" y="912" width="16" height="16" fill="#8e44ad"/><text x="324" y="925">ch 9: 3.3 V (RX VCC)</text>
+    <rect x="40" y="890" width="16" height="16" fill="#7f8c8d"/><text x="64" y="903">ch 12: 0 V (GND, RX DIR, both OE)</text>
+    <rect x="40" y="912" width="16" height="16" fill="#e67e22"/><text x="64" y="925">ch 11: 2.5 V (TX VCC and DIR)</text>
+    <rect x="300" y="912" width="16" height="16" fill="#8e44ad"/><text x="324" y="925">ch 10: 3.3 V (RX VCC)</text>
   </g>
 </svg>

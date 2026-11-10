@@ -48,10 +48,14 @@ const uint8_t DAC_CMD_START = 0x00; // writing voltage value to a DAC
 const uint8_t RST_CMD_START = 0x01; // pulling down Reset pin
 const uint8_t SPI_CMD_START = 0x02; // writing SPI command
 const uint8_t TRIG_CMD_START = 0x03; // choosing the GPIO that watches trigger-out (0 = disabled)
+const uint8_t CH9_RST_CMD_START = 0x04; // hold channel 9 (SPI reset, active low) at 0 V for N ms
 
-// Channels 0-8 are experiment voltages. 9-11 power the two level-shifter chips and are
-// kept out of the channel grid, the All buttons and presets.
-#define NUM_USER_CHANNELS 9
+// Channel numbers in the code are 0-based indexes; everything the user sees (GUI labels, preset
+// files, README, the board's own markings) counts from 1, i.e. label = index + 1.
+// Indexes 0-7 (channels 1-8) are experiment voltages. Index 8 (channel 9) is the SPI target's
+// active-low reset: it idles at 2.5 V and is pulsed to 0 V (see on_ch9_reset_clicked). Indexes 9-11 (channels 10-12) power the
+// two level-shifter chips and are kept out of the channel grid, the All buttons and presets.
+#define NUM_USER_CHANNELS 8
 #define LS_CH_RX_VCC  9   // VCC of the RX chip (chip -> Feather), 3.3 V
 #define LS_CH_TX_VCC  10  // VCC of the TX chip (Feather -> chip) and its DIR, 2.5 V
 #define LS_CH_GND     11  // GND of both chips, RX DIR and both OE pins, 0 V
@@ -728,6 +732,21 @@ static void on_reset_clicked(GtkButton *button) {
     send_bytes(msg, sizeof(msg));
 }
 
+// Holds channel 9 (SPI reset, active low) at 0 V for the entered milliseconds; the board times it.
+static void on_ch9_reset_clicked(GtkWidget *widget, gpointer user_data) {
+    GtkEditable *entry = GTK_EDITABLE(user_data);
+    char *end = NULL;
+    long ms = strtol(gtk_editable_get_text(entry), &end, 10);
+    if (end == gtk_editable_get_text(entry) || *end != '\0' || ms < 1 || ms > 60000) {
+        set_status("Reset low time must be a whole number of ms, 1 to 60000.");
+        return;
+    }
+    if (!require_connection()) return;
+    uint8_t msg[3] = {CH9_RST_CMD_START, (uint8_t)(ms >> 8), (uint8_t)(ms & 0xFF)};
+    g_print("Channel 9 reset: low for %ld ms\n", ms);
+    if (send_bytes(msg, sizeof(msg))) set_status("Channel 9 reset pulsed low for %ld ms", ms);
+}
+
 static void on_entry_activate(GtkEntry *entry, gpointer user_data) {
     double value = atof(gtk_editable_get_text(GTK_EDITABLE(entry)));
     apply_value(entry, value);
@@ -1175,19 +1194,36 @@ static GKeyFile *presets_open(void) {
     return kf;
 }
 
-// Returns the key in `group` that refers to channel `ch` ("ch3" or "ch3 (READBIAS1)"), or NULL
+// Returns the key in `group` that refers to channel index `ch` ("ch4" or "ch4 (READBIAS1)"; keys
+// are numbered from 1 like the board, so index 3 is "ch4"), or NULL
 static char *preset_key_for_channel(GKeyFile *kf, const char *group, int ch) {
     gchar **keys = g_key_file_get_keys(kf, group, NULL, NULL);
     char *found = NULL;
     for (int i = 0; keys && keys[i] && !found; i++) {
         int num, n = 0;
         if (sscanf(keys[i], "ch%d%n", &num, &n) < 1) continue;
-        if (num == ch && (keys[i][n] == '\0' || keys[i][n] == ' ' || keys[i][n] == '('))
+        if (num == ch + 1 && (keys[i][n] == '\0' || keys[i][n] == ' ' || keys[i][n] == '('))
             found = g_strdup(keys[i]);
     }
     g_strfreev(keys);
     return found;
 }
+
+// True if `group` still uses the old 0-based numbering (it has a "ch0" key, which can't exist in
+// the 1-12 numbering). Loading or saving such a preset would shift every voltage by one channel.
+static gboolean preset_is_legacy(GKeyFile *kf, const char *group) {
+    gchar **keys = g_key_file_get_keys(kf, group, NULL, NULL);
+    gboolean legacy = FALSE;
+    for (int i = 0; keys && keys[i] && !legacy; i++) {
+        int num, n = 0;
+        if (sscanf(keys[i], "ch%d%n", &num, &n) < 1) continue;
+        legacy = num == 0 && (keys[i][n] == '\0' || keys[i][n] == ' ' || keys[i][n] == '(');
+    }
+    g_strfreev(keys);
+    return legacy;
+}
+
+#define PRESET_LEGACY_MSG "Preset \"%s\" uses the old channel numbers (ch0-ch11). Rename its keys to ch1-ch12 (each +1)."
 
 // Pulls NAME out of a preset key like "ch3 (READBIAS1)"; empty string when there is no label
 static char *name_from_key(const char *key) {
@@ -1198,13 +1234,13 @@ static char *name_from_key(const char *key) {
     return g_strdup("");
 }
 
-// Builds the preset key for a channel: "ch3 (NAME)", or plain "ch3" when it has no name.
+// Builds the preset key for channel index `ch`: "ch4 (NAME)", or plain "ch4" when it has no name.
 // Characters that can't appear in a key are replaced.
 static char *key_for_channel(int ch, const char *name) {
     char *clean = g_strstrip(g_strdup(name));
     for (char *p = clean; *p; p++)
         if (*p == '=' || *p == '[' || *p == ']' || g_ascii_iscntrl(*p)) *p = '-';
-    char *key = clean[0] ? g_strdup_printf("ch%d (%s)", ch, clean) : g_strdup_printf("ch%d", ch);
+    char *key = clean[0] ? g_strdup_printf("ch%d (%s)", ch + 1, clean) : g_strdup_printf("ch%d", ch + 1);
     g_free(clean);
     return key;
 }
@@ -1241,6 +1277,11 @@ static void preset_apply(PresetData *pd, gboolean send) {
     GKeyFile *kf = presets_open();
     gboolean present[12] = { FALSE };
     int loaded = 0;
+
+    if (preset_is_legacy(kf, name)) {
+        set_status(PRESET_LEGACY_MSG, name);
+        goto done;
+    }
 
     for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         char *key = preset_key_for_channel(kf, name, i);
@@ -1298,6 +1339,12 @@ static void on_preset_save_clicked(GtkButton *button, gpointer user_data) {
     }
 
     GKeyFile *kf = presets_open();
+    if (preset_is_legacy(kf, name)) {
+        set_status(PRESET_LEGACY_MSG, name);
+        g_key_file_free(kf);
+        g_free(name);
+        return;
+    }
     // Replace each channel's key (its text includes the name, so drop any old spelling first)
     for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         char val[32];
@@ -1622,7 +1669,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
 
     for (int i = 0; i < NUM_USER_CHANNELS; i++) {
         char label_text[32];
-        snprintf(label_text, sizeof(label_text), "Channel %d:", i);
+        snprintf(label_text, sizeof(label_text), "Channel %d:", i + 1);
         GtkWidget *label = gtk_label_new(label_text);
 
         // Editable channel name; saved with presets as "chN (name)"
@@ -1756,7 +1803,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(vbox), preset_box);
     presets_reload(preset_data, NULL);
 	
-    // Level Shifters section: channels 9-11 power the two 245 chips (see README)
+    // Level Shifters section: channels 10-12 power the two 245 chips (see README)
     GtkWidget *sep_ls = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_widget_set_margin_top(sep_ls, 8);
     gtk_widget_set_margin_bottom(sep_ls, 8);
@@ -1766,15 +1813,15 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_label_set_markup(GTK_LABEL(ls_title), "<b>Level Shifters</b>");
     gtk_box_append(GTK_BOX(vbox), ls_title);
 
-    GtkWidget *ls_note = gtk_label_new("Channels 9-11 power the SPI level-shifter chips. Changing these changes the chip's signal levels.");
+    GtkWidget *ls_note = gtk_label_new("Channels 10-12 power the SPI level-shifter chips. Changing these changes the chip's signal levels.");
     gtk_label_set_wrap(GTK_LABEL(ls_note), TRUE);
     gtk_label_set_justify(GTK_LABEL(ls_note), GTK_JUSTIFY_CENTER);
     gtk_box_append(GTK_BOX(vbox), ls_note);
 
     const char *ls_names[3] = {
-        "GND / RX DIR / OE (ch 11)",
-        "TX VCC / TX DIR (ch 10)",
-        "RX VCC (ch 9)"
+        "GND / RX DIR / OE (ch 12)",
+        "TX VCC / TX DIR (ch 11)",
+        "RX VCC (ch 10)"
     };
     LevelShiftData *ls_data = g_new0(LevelShiftData, 1);
     GtkWidget *ls_grid = gtk_grid_new();
@@ -1852,6 +1899,22 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(spi_settings), mode_dropdown);
     gtk_box_append(GTK_BOX(spi_settings), reset_btn);
     gtk_box_append(GTK_BOX(vbox), spi_settings);
+
+    // Channel 9 reset: idles at 2.5 V, goes to 0 V for the entered time
+    GtkWidget *ch9_entry = gtk_entry_new();
+    gtk_editable_set_text(GTK_EDITABLE(ch9_entry), "10");
+    gtk_entry_set_input_purpose(GTK_ENTRY(ch9_entry), GTK_INPUT_PURPOSE_DIGITS);
+    gtk_editable_set_width_chars(GTK_EDITABLE(ch9_entry), 6);
+    gtk_widget_set_tooltip_text(ch9_entry, "How long channel 9 stays at 0 V (1-60000 ms)");
+    GtkWidget *ch9_btn = gtk_button_new_with_label("PULSE RESET (ch 9)");
+    gtk_widget_set_tooltip_text(ch9_btn, "Channel 9 idles at 2.5 V; this drops it to 0 V for the time shown, then back");
+    g_signal_connect(ch9_btn, "clicked", G_CALLBACK(on_ch9_reset_clicked), ch9_entry);
+    g_signal_connect(ch9_entry, "activate", G_CALLBACK(on_ch9_reset_clicked), ch9_entry);
+    GtkWidget *ch9_box = wrap_row();
+    gtk_box_append(GTK_BOX(ch9_box), gtk_label_new("Ch 9 reset low (ms):"));
+    gtk_box_append(GTK_BOX(ch9_box), ch9_entry);
+    gtk_box_append(GTK_BOX(ch9_box), ch9_btn);
+    gtk_box_append(GTK_BOX(vbox), ch9_box);
 	
 	// SPI byte grid
 	GtkWidget *spi_grid = gtk_grid_new();
