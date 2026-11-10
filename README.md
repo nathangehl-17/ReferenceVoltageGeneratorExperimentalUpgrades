@@ -268,7 +268,7 @@ The chip's signals are 2.5 V but the Feather's inputs are 3.3 V logic (input-hig
 
 Channel numbers in the v2.0 GUI, in preset files (`ch1` to `ch12`), on the Feather's screen and in this section match the 1-12 markings on the board. A preset file that still uses the old numbers (it has a `ch0` key) is refused with a message, because loading it would shift every voltage by one channel. To convert one, add 1 to every channel number in its keys.
 
-The chips' power and control pins come from DAC channels 10-12. Channels 1-9 remain experiment voltages. Channels 10-12 do not appear in the channel grid, and All OFF / All UPDATE / presets never touch them. The firmware sets them at boot, and the **Level Shifters** section of the GUI can change them.
+The chips' power and control pins come from DAC channels 10-12. Channels 1-8 remain experiment voltages. Channel 9 is the SPI target's active-low reset (see below). Channels 10-12 do not appear in the channel grid, and All OFF / All UPDATE / presets never touch them. The firmware sets them at boot, and the **Level Shifters** section of the GUI can change them.
 
 | Channel | Default | Connect to |
 | :--- | :--- | :--- |
@@ -280,6 +280,8 @@ The chips' power and control pins come from DAC channels 10-12. Channels 1-9 rem
 *Figure 8. Wiring between the Feather, the two level-shifter chips and the PSEC chip.*
 
 Caution: the DAC70501 has limited output drive, and channel 12 acting as GND must sink the current of both chips' outputs. Check the datasheet limits, and use a real ground with channel 12 only on DIR/OE if the rails sag.
+
+**Channel 9 reset:** channel 9 is no longer an adjustable voltage. The firmware holds it at 2.5 V (high) from boot, and the **PULSE RESET (ch 9)** button in the SPI Communication section drops it to 0 V for the number of milliseconds in the **Ch 9 reset low (ms)** box (1-60000, default 10; Enter in the box also fires it), then returns it to 2.5 V. The Feather times the pulse. The separate **RESET** button still pulses GPIO 11.
 
 **Trigger Out:** pick the pin the trigger-out line is wired to in the **Trigger Out** section (D13 or A0-A5, or Disabled; these are GPIO 13, 18, 17, 16, 15, 14 and 8). D13 shares its pin with the on-board LED. The selected pin uses the Feather's internal pull-down so an unconnected pin reads low instead of picking up noise. The count restarts at 0 each time you pick a pin or connect. The **Debounce (ms)** box (default 50) merges bursts of edges, such as a wire bouncing as it touches a source, into one count: an edge only counts if none was seen in the previous N ms, and every edge restarts that period. Set it to 0 to count every edge, and keep it shorter than the gap between real triggers. Changing it restarts the count. The Feather counts rising edges and the GUI shows the count, the last trigger both as board uptime and as seconds ago (counting up live), and a flashing indicator. The other logic pins (5, 6, 9, 10, 11, 12) are already used for the I2C banks, RESET and chip select, so they are not offered.
 
